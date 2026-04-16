@@ -8,6 +8,8 @@ import re
 import subprocess
 import shutil
 import random
+from dataclasses import dataclass, field
+from typing import List, Optional
 from utils import (
     Banner,
     show_banner,
@@ -30,6 +32,7 @@ except RuntimeError:
 from pyrogram import Client
 from pyrogram import raw
 from pyrogram.types import InputMediaAudio, InputMediaDocument, InputMediaPhoto, InputMediaVideo
+from pyrogram.errors import FloodWait, TakeoutInitDelay
 import pyrogram
 
 """ Global """
@@ -39,6 +42,133 @@ MEDIA_CAPTION_LIMIT = 1024
 runtime_lock_path = None
 task_lock_path = None
 run_download_path = None
+DOWNLOAD_WORKERS = 4
+PREUPLOAD_WORKERS = 3
+PUBLISH_WORKERS = 1
+MAX_TEMP_BYTES_PER_JOB = 2 * 1024 * 1024 * 1024
+RESERVE_MARGIN_SINGLE = 8 * 1024 * 1024
+RESERVE_MARGIN_ALBUM = 16 * 1024 * 1024
+SCHEDULE_LOOKAHEAD = max(DOWNLOAD_WORKERS + PREUPLOAD_WORKERS + 3, 16)
+UPLOAD_CLIENT_MAX_CONCURRENT_TRANSMISSIONS = PUBLISH_WORKERS + 1
+PREUPLOAD_CLIENT_MAX_CONCURRENT_TRANSMISSIONS = PREUPLOAD_WORKERS
+DOWNLOAD_CLIENT_MAX_CONCURRENT_TRANSMISSIONS = DOWNLOAD_WORKERS
+
+@dataclass
+class WorkItem:
+    seq: int
+    kind: str
+    messages: List
+    estimated_bytes: int
+    label: str
+    media_kind: str
+    state: str = "pending"
+    reserved_bytes: int = 0
+    actual_bytes: int = 0
+    local_paths: List[str] = field(default_factory=list)
+    aux_paths: List[str] = field(default_factory=list)
+    overflow_text: str = ""
+    error: str = ""
+    download_started_at: Optional[float] = None
+    download_finished_at: Optional[float] = None
+    preupload_started_at: Optional[float] = None
+    preupload_finished_at: Optional[float] = None
+    send_started_at: Optional[float] = None
+    send_finished_at: Optional[float] = None
+    remote_media: object = None
+    remote_media_group: List[object] = field(default_factory=list)
+    caption_text: str = ""
+
+    @property
+    def first_message(self):
+        return self.messages[0]
+
+    @property
+    def last_message_id(self):
+        return self.messages[-1].id
+
+    @property
+    def display_message_id(self):
+        return self.first_message.id
+
+    @property
+    def needs_download(self):
+        return self.kind == "album" or not self.first_message.text
+
+class BudgetManager:
+    def __init__(self, max_bytes):
+        self.max_bytes = max_bytes
+        self.reserved_bytes = 0
+        self.oversize_owner_seq = None
+        self._condition = asyncio.Condition()
+
+    def current_bytes(self):
+        return self.reserved_bytes
+
+    def _can_reserve(self, item):
+        if self.oversize_owner_seq is not None:
+            return False
+        if item.estimated_bytes > self.max_bytes:
+            return self.reserved_bytes == 0
+        return (self.reserved_bytes + item.estimated_bytes) <= self.max_bytes
+
+    async def reserve(self, item):
+        waited = False
+        async with self._condition:
+            while not self._can_reserve(item):
+                waited = True
+                item.state = "waiting_budget"
+                await self._condition.wait()
+
+            self.reserved_bytes += item.estimated_bytes
+            item.reserved_bytes = item.estimated_bytes
+            item.state = "reserved"
+
+            if item.estimated_bytes > self.max_bytes:
+                self.oversize_owner_seq = item.seq
+        return waited
+
+    async def adjust_after_download(self, item, actual_bytes):
+        async with self._condition:
+            delta = actual_bytes - item.reserved_bytes
+            self.reserved_bytes = max(0, self.reserved_bytes + delta)
+            item.actual_bytes = actual_bytes
+            item.reserved_bytes = actual_bytes
+            self._condition.notify_all()
+
+    async def release(self, item):
+        async with self._condition:
+            self.reserved_bytes = max(0, self.reserved_bytes - item.reserved_bytes)
+            if self.oversize_owner_seq == item.seq:
+                self.oversize_owner_seq = None
+            item.reserved_bytes = 0
+            self._condition.notify_all()
+
+@dataclass
+class CloneJobContext:
+    channel_source: int
+    destination: dict
+    chat_title: str
+    custom_caption: str
+    progress_file: str
+    work_items: List[WorkItem]
+    budget: BudgetManager
+    download_queue: asyncio.PriorityQueue
+    preupload_queue: asyncio.PriorityQueue
+    destination_peer: object = None
+    ready_items: dict = field(default_factory=dict)
+    total_items: int = 0
+    started_at: float = 0.0
+    next_seq_to_publish: int = 1
+    scheduled_until_seq: int = 0
+    success_count: int = 0
+    failure_count: int = 0
+    log_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    ready_condition: asyncio.Condition = field(default_factory=asyncio.Condition)
+    schedule_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    download_slot_condition: asyncio.Condition = field(default_factory=asyncio.Condition)
+    preupload_slot_condition: asyncio.Condition = field(default_factory=asyncio.Condition)
+    active_background_downloads: int = 0
+    active_background_preuploads: int = 0
 
 def resolve_binary(executable_name):
     local_path = os.path.join("tools", "ffmpeg", "bin", executable_name)
@@ -59,7 +189,7 @@ def create_forum_topic(client, target_chat_id, topic_title):
         raw.functions.channels.CreateForumTopic(
             channel=input_channel,
             title=topic_title,
-            random_id=random.getrandbits(64),
+            random_id=random.randrange(1, 1 << 63),
             icon_color=0x6FB9F0,
         )
     )
@@ -111,7 +241,7 @@ def resolve_target_destination(client, source_chat, target_chat):
     if target_chat.type == pyrogram.enums.ChatType.GROUP:
         print("O destino escolhido e um grupo basico.")
         print("1 - Continuar clonando no grupo em si")
-        print("2 - Converter para supergrupo e depois decidir sobre topicos")
+        print("2 - Converter para supergrupo, ativar topicos e criar o topico da origem")
         print("3 - Cancelar")
         choice = input("Escolha (1/2/3): ").strip() or "1"
         if choice == "1":
@@ -124,6 +254,22 @@ def resolve_target_destination(client, source_chat, target_chat):
         print(f"Grupo convertido para supergrupo: {migrated_chat.id}")
         target_chat = migrated_chat
         destination["chat_id"] = migrated_chat.id
+        source_title = source_chat.title or "Topico"
+
+        if not getattr(target_chat, "is_forum", False):
+            input_channel = client.resolve_peer(target_chat.id)
+            client.invoke(
+                raw.functions.channels.ToggleForum(
+                    channel=input_channel,
+                    enabled=True,
+                )
+            )
+
+        topic_id = create_forum_topic(client, target_chat.id, source_title)
+        destination["thread_id"] = topic_id
+        destination["mode_label"] = f"topico:{topic_id}"
+        print(f"Forum ativado e topico criado: '{normalize_topic_title(source_title)}' (ID {topic_id}).")
+        return destination
 
     if target_chat.type != pyrogram.enums.ChatType.SUPERGROUP:
         print("Destino sem suporte a topicos. O envio sera feito para o chat em si.")
@@ -454,8 +600,159 @@ def simplify_error(error):
         return "o Telegram nao aceitou os botoes desta mensagem."
     return text
 
-def refresh_message(client, message):
-    refreshed = client.get_messages(message.chat.id, message.id)
+def measure_paths_size(paths):
+    total = 0
+    for path in paths:
+        if path and os.path.exists(path):
+            total += os.path.getsize(path)
+    return total
+
+def get_media_size(message):
+    media = get_message_media(message)
+    return getattr(media, "file_size", 0) or 0
+
+def estimate_single_message_bytes(message):
+    if message.text:
+        return 0
+    return get_media_size(message) + RESERVE_MARGIN_SINGLE
+
+def estimate_album_bytes(messages):
+    return sum(get_media_size(message) for message in messages) + RESERVE_MARGIN_ALBUM
+
+def format_phase_duration(started_at, finished_at):
+    if not started_at or not finished_at:
+        return "00:00"
+    return format_seconds(finished_at - started_at)
+
+def format_budget_usage(context):
+    return f"{format_bytes(context.budget.current_bytes())}/{format_bytes(context.budget.max_bytes)}"
+
+async def log_context(context, message):
+    async with context.log_lock:
+        print(message)
+
+def build_work_items(messages, choices):
+    work_queue = build_work_queue(messages, choices)
+    items = []
+    for seq, (kind, payload) in enumerate(work_queue, start=1):
+        if kind == "album":
+            items.append(
+                WorkItem(
+                    seq=seq,
+                    kind="album",
+                    messages=list(payload),
+                    estimated_bytes=estimate_album_bytes(payload),
+                    label=f"Album {getattr(payload[0], 'media_group_id', 'sem_id')}",
+                    media_kind="album",
+                )
+            )
+        else:
+            message = payload
+            items.append(
+                WorkItem(
+                    seq=seq,
+                    kind="message",
+                    messages=[message],
+                    estimated_bytes=estimate_single_message_bytes(message),
+                    label=f"Mensagem {message.id} ({media_kind_label(message)})",
+                    media_kind=media_kind_label(message),
+                )
+            )
+    return items
+
+def get_head_item(context):
+    if 1 <= context.next_seq_to_publish <= context.total_items:
+        return context.work_items[context.next_seq_to_publish - 1]
+    return None
+
+def is_item_ready_for_publish(item):
+    return item.state in ("ready", "failed", "done")
+
+def is_head_blocked(context):
+    head_item = get_head_item(context)
+    return bool(head_item and not is_item_ready_for_publish(head_item))
+
+def schedule_target_seq(context):
+    if is_head_blocked(context):
+        return min(context.total_items, context.next_seq_to_publish + 2)
+    return min(context.total_items, context.next_seq_to_publish + SCHEDULE_LOOKAHEAD - 1)
+
+def queue_lane_label(context, item):
+    if item.seq == context.next_seq_to_publish:
+        return "faixa rapida"
+    if item.seq <= context.next_seq_to_publish + 2:
+        return "prioridade proxima"
+    return "fundo"
+
+async def enqueue_download_item(context, item):
+    await context.download_queue.put((item.seq, item))
+
+async def enqueue_preupload_item(context, item):
+    await context.preupload_queue.put((item.seq, item))
+
+async def notify_pipeline_slots(context):
+    async with context.download_slot_condition:
+        context.download_slot_condition.notify_all()
+    async with context.preupload_slot_condition:
+        context.preupload_slot_condition.notify_all()
+
+async def acquire_background_slot(context, stage_name, item):
+    if item.seq == context.next_seq_to_publish:
+        return False
+
+    if stage_name == "download":
+        condition = context.download_slot_condition
+        attr_name = "active_background_downloads"
+        limit = max(0, DOWNLOAD_WORKERS - 1)
+    else:
+        condition = context.preupload_slot_condition
+        attr_name = "active_background_preuploads"
+        limit = max(0, PREUPLOAD_WORKERS - 1)
+
+    async with condition:
+        while is_head_blocked(context) and getattr(context, attr_name) >= limit:
+            await condition.wait()
+        setattr(context, attr_name, getattr(context, attr_name) + 1)
+    return True
+
+async def release_background_slot(context, stage_name, acquired_slot):
+    if not acquired_slot:
+        return
+
+    if stage_name == "download":
+        condition = context.download_slot_condition
+        attr_name = "active_background_downloads"
+    else:
+        condition = context.preupload_slot_condition
+        attr_name = "active_background_preuploads"
+
+    async with condition:
+        setattr(context, attr_name, max(0, getattr(context, attr_name) - 1))
+        condition.notify_all()
+
+async def schedule_more_items(context):
+    async with context.schedule_lock:
+        target_seq = schedule_target_seq(context)
+        while context.scheduled_until_seq < target_seq:
+            item = context.work_items[context.scheduled_until_seq]
+            context.scheduled_until_seq += 1
+            if item.needs_download:
+                await enqueue_download_item(context, item)
+            else:
+                item.state = "ready"
+                async with context.ready_condition:
+                    context.ready_items[item.seq] = item
+                    context.ready_condition.notify_all()
+
+async def call_telegram(operation, *args, **kwargs):
+    while True:
+        try:
+            return await operation(*args, **kwargs)
+        except FloodWait as error:
+            await asyncio.sleep(error.value)
+
+async def refresh_message(client, message):
+    refreshed = await call_telegram(client.get_messages, message.chat.id, message.id)
     return refreshed or message
 
 def get_message_media(message):
@@ -468,30 +765,240 @@ def get_message_media(message):
         or message.animation
     )
 
-def download_media_with_retry(client, message, file_name, attempts=2, progress_callback=None):
+def build_raw_input_document(uploaded_document):
+    return raw.types.InputDocument(
+        id=uploaded_document.id,
+        access_hash=uploaded_document.access_hash,
+        file_reference=uploaded_document.file_reference,
+    )
+
+def build_raw_input_photo(uploaded_photo):
+    return raw.types.InputPhoto(
+        id=uploaded_photo.id,
+        access_hash=uploaded_photo.access_hash,
+        file_reference=uploaded_photo.file_reference,
+    )
+
+async def upload_media_reference(upload_client, peer, message, file_name, thumb_path=None):
+    if message.photo:
+        uploaded = await call_telegram(
+            upload_client.invoke,
+            raw.functions.messages.UploadMedia(
+                peer=peer,
+                media=raw.types.InputMediaUploadedPhoto(
+                    file=await upload_client.save_file(file_name),
+                ),
+            ),
+        )
+        return raw.types.InputMediaPhoto(id=build_raw_input_photo(uploaded.photo))
+
+    if message.video:
+        thumb = await upload_client.save_file(thumb_path) if thumb_path else None
+        uploaded = await call_telegram(
+            upload_client.invoke,
+            raw.functions.messages.UploadMedia(
+                peer=peer,
+                media=raw.types.InputMediaUploadedDocument(
+                    mime_type=upload_client.guess_mime_type(file_name) or "video/mp4",
+                    file=await upload_client.save_file(file_name),
+                    thumb=thumb,
+                    attributes=[
+                        raw.types.DocumentAttributeVideo(
+                            supports_streaming=True,
+                            duration=await asyncio.to_thread(collect_video_duration, file_name) or getattr(message.video, "duration", 0) or 0,
+                            w=getattr(message.video, "width", 0) or 0,
+                            h=getattr(message.video, "height", 0) or 0,
+                        ),
+                        raw.types.DocumentAttributeFilename(file_name=os.path.basename(file_name)),
+                    ],
+                ),
+            ),
+        )
+        return raw.types.InputMediaDocument(id=build_raw_input_document(uploaded.document))
+
+    if message.audio:
+        uploaded = await call_telegram(
+            upload_client.invoke,
+            raw.functions.messages.UploadMedia(
+                peer=peer,
+                media=raw.types.InputMediaUploadedDocument(
+                    mime_type=upload_client.guess_mime_type(file_name) or "audio/mpeg",
+                    file=await upload_client.save_file(file_name),
+                    attributes=[
+                        raw.types.DocumentAttributeAudio(
+                            duration=getattr(message.audio, "duration", 0) or 0,
+                            performer=getattr(message.audio, "performer", None),
+                            title=getattr(message.audio, "title", None),
+                        ),
+                        raw.types.DocumentAttributeFilename(file_name=os.path.basename(file_name)),
+                    ],
+                ),
+            ),
+        )
+        return raw.types.InputMediaDocument(id=build_raw_input_document(uploaded.document))
+
+    if message.document:
+        uploaded = await call_telegram(
+            upload_client.invoke,
+            raw.functions.messages.UploadMedia(
+                peer=peer,
+                media=raw.types.InputMediaUploadedDocument(
+                    mime_type=upload_client.guess_mime_type(file_name) or "application/octet-stream",
+                    file=await upload_client.save_file(file_name),
+                    attributes=[
+                        raw.types.DocumentAttributeFilename(file_name=os.path.basename(file_name)),
+                    ],
+                ),
+            ),
+        )
+        return raw.types.InputMediaDocument(id=build_raw_input_document(uploaded.document))
+
+    if message.animation:
+        thumb = await upload_client.save_file(thumb_path) if thumb_path else None
+        uploaded = await call_telegram(
+            upload_client.invoke,
+            raw.functions.messages.UploadMedia(
+                peer=peer,
+                media=raw.types.InputMediaUploadedDocument(
+                    mime_type=upload_client.guess_mime_type(file_name) or "video/mp4",
+                    file=await upload_client.save_file(file_name),
+                    thumb=thumb,
+                    attributes=[
+                        raw.types.DocumentAttributeVideo(
+                            supports_streaming=True,
+                            duration=getattr(message.animation, "duration", 0) or 0,
+                            w=getattr(message.animation, "width", 0) or 0,
+                            h=getattr(message.animation, "height", 0) or 0,
+                        ),
+                        raw.types.DocumentAttributeFilename(file_name=os.path.basename(file_name)),
+                        raw.types.DocumentAttributeAnimated(),
+                    ],
+                ),
+            ),
+        )
+        return raw.types.InputMediaDocument(id=build_raw_input_document(uploaded.document))
+
+    if message.sticker:
+        uploaded = await call_telegram(
+            upload_client.invoke,
+            raw.functions.messages.UploadMedia(
+                peer=peer,
+                media=raw.types.InputMediaUploadedDocument(
+                    mime_type=upload_client.guess_mime_type(file_name) or "image/webp",
+                    file=await upload_client.save_file(file_name),
+                    attributes=[
+                        raw.types.DocumentAttributeFilename(file_name=os.path.basename(file_name)),
+                        raw.types.DocumentAttributeSticker(
+                            alt=getattr(message.sticker, "emoji", "") or "",
+                            stickerset=raw.types.InputStickerSetEmpty(),
+                        ),
+                    ],
+                ),
+            ),
+        )
+        return raw.types.InputMediaDocument(id=build_raw_input_document(uploaded.document))
+
+    raise RuntimeError("Tipo de mídia não suportado para pre-upload.")
+
+async def prepare_single_item_for_publish(preupload_client, destination_peer, context, item):
+    message = item.first_message
+    final_caption = get_caption(message, context.custom_caption)
+    media_caption, overflow_text = split_caption_for_media(final_caption)
+    item.caption_text = media_caption
+    item.overflow_text = overflow_text
+
+    if message.text:
+        item.state = "ready"
+        return
+
+    file_name = item.local_paths[0]
+    thumb_path = None
+    if message.video or message.animation:
+        thumb_path = await asyncio.to_thread(extract_thumbnail, file_name)
+        if thumb_path:
+            item.aux_paths.append(thumb_path)
+
+    item.remote_media = await upload_media_reference(preupload_client, destination_peer, message, file_name, thumb_path)
+    item.state = "ready"
+
+async def prepare_album_for_publish(preupload_client, destination_peer, context, item):
+    item.remote_media_group = []
+    first_caption, overflow_text = split_caption_for_media(get_caption(item.first_message, context.custom_caption))
+    item.caption_text = first_caption
+    item.overflow_text = overflow_text
+
+    for index, message in enumerate(item.messages):
+        file_name = item.local_paths[index]
+        thumb_path = None
+        if message.video:
+            thumb_path = await asyncio.to_thread(extract_thumbnail, file_name)
+            if thumb_path:
+                item.aux_paths.append(thumb_path)
+        remote_media = await upload_media_reference(preupload_client, destination_peer, message, file_name, thumb_path)
+        item.remote_media_group.append(remote_media)
+
+    item.state = "ready"
+
+async def preupload_item(preupload_client, destination_peer, context, item, worker_id):
+    item.preupload_started_at = time.time()
+    item.state = "preuploading"
+    try:
+        if item.kind == "album":
+            await prepare_album_for_publish(preupload_client, destination_peer, context, item)
+        else:
+            await prepare_single_item_for_publish(preupload_client, destination_peer, context, item)
+        item.preupload_finished_at = time.time()
+        await log_context(
+            context,
+            f"[PRE{worker_id}] {item.label}: pre-upload concluido em {format_phase_duration(item.preupload_started_at, item.preupload_finished_at)}",
+        )
+        async with context.ready_condition:
+            context.ready_items[item.seq] = item
+            context.ready_condition.notify_all()
+        await schedule_more_items(context)
+        await notify_pipeline_slots(context)
+    except Exception as error:
+        item.error = simplify_error(error)
+        item.state = "failed"
+        item.preupload_finished_at = time.time()
+        await log_context(context, f"[PRE{worker_id}] {item.label}: falhou no pre-upload porque {item.error}")
+        async with context.ready_condition:
+            context.ready_items[item.seq] = item
+            context.ready_condition.notify_all()
+        await schedule_more_items(context)
+        await notify_pipeline_slots(context)
+    finally:
+        cleanup_paths(item.local_paths)
+        cleanup_paths(item.aux_paths)
+        item.local_paths = []
+        item.aux_paths = []
+        await context.budget.release(item)
+
+async def download_media_with_retry(client, message, file_name, attempts=2):
     current_message = message
     for attempt in range(attempts):
         try:
             media = get_message_media(current_message)
             if not media:
                 raise RuntimeError("Mensagem sem midia para baixar.")
-            return client.download_media(
+            return await call_telegram(
+                client.download_media,
                 media,
                 file_name=file_name,
-                progress=progress_callback,
             ), current_message
         except Exception as error:
             if "FILE_REFERENCE_EXPIRED" in str(error).upper() and attempt < attempts - 1:
-                current_message = refresh_message(client, current_message)
-                time.sleep(1)
+                current_message = await refresh_message(client, current_message)
+                await asyncio.sleep(1)
                 continue
             raise
 
-def send_video_with_metadata(client, destination, message, final_caption, file_name, progress_callback=None):
-    duration = collect_video_duration(file_name) or getattr(message.video, "duration", 0) or 0
+async def send_video_with_metadata(client, destination, message, final_caption, file_name):
+    duration = await asyncio.to_thread(collect_video_duration, file_name)
+    duration = duration or getattr(message.video, "duration", 0) or 0
     width = getattr(message.video, "width", None)
     height = getattr(message.video, "height", None)
-    thumbnail_path = extract_thumbnail(file_name)
+    thumbnail_path = await asyncio.to_thread(extract_thumbnail, file_name)
 
     kwargs = {
         "chat_id": destination["chat_id"],
@@ -500,8 +1007,6 @@ def send_video_with_metadata(client, destination, message, final_caption, file_n
         "duration": duration,
         "supports_streaming": True,
     }
-    if progress_callback:
-        kwargs["progress"] = progress_callback
     if destination.get("thread_id"):
         kwargs["message_thread_id"] = destination["thread_id"]
     reply_markup = get_reply_markup(message)
@@ -515,7 +1020,7 @@ def send_video_with_metadata(client, destination, message, final_caption, file_n
         kwargs["thumb"] = thumbnail_path
 
     try:
-        safe_send_with_buttons(
+        await safe_send_with_buttons(
             client.send_video,
             fallback_func=client.send_video,
             **kwargs,
@@ -565,26 +1070,53 @@ def build_input_media(message, file_name, caption_text):
         return InputMediaDocument(media=file_name, caption=caption_text or "")
     raise RuntimeError("Tipo de mídia não suportado em álbum.")
 
-def send_overflow_text(client, destination, overflow_text, processed, total, message_id):
+async def build_input_media_async(message, file_name, caption_text):
+    caption_text, _ = split_caption_for_media(caption_text)
+    if message.photo:
+        return InputMediaPhoto(media=file_name, caption=caption_text or ""), None
+    if message.video:
+        thumb = await asyncio.to_thread(extract_thumbnail, file_name)
+        duration = await asyncio.to_thread(collect_video_duration, file_name)
+        return InputMediaVideo(
+            media=file_name,
+            caption=caption_text or "",
+            duration=duration or getattr(message.video, "duration", 0) or 0,
+            width=getattr(message.video, "width", None),
+            height=getattr(message.video, "height", None),
+            supports_streaming=True,
+            thumb=thumb or None,
+        ), thumb
+    if message.audio:
+        return InputMediaAudio(
+            media=file_name,
+            caption=caption_text or "",
+            duration=getattr(message.audio, "duration", None),
+            performer=getattr(message.audio, "performer", None),
+            title=getattr(message.audio, "title", None),
+        ), None
+    if message.document:
+        return InputMediaDocument(media=file_name, caption=caption_text or ""), None
+    raise RuntimeError("Tipo de mídia não suportado em álbum.")
+
+async def send_overflow_text(client, destination, overflow_text):
     if not overflow_text:
         return
-    print_stage(processed, total, message_id, "enviando texto complementar")
     kwargs = {
         "chat_id": destination["chat_id"],
         "text": overflow_text,
     }
     if destination.get("thread_id"):
         kwargs["message_thread_id"] = destination["thread_id"]
-    client.send_message(**kwargs)
+    await call_telegram(client.send_message, **kwargs)
 
-def safe_send_with_buttons(send_func, fallback_func=None, **kwargs):
+async def safe_send_with_buttons(send_func, fallback_func=None, **kwargs):
     try:
-        return send_func(**kwargs)
+        return await call_telegram(send_func, **kwargs)
     except Exception as error:
         if "REPLY_MARKUP_INVALID" in str(error).upper() and fallback_func:
             fallback_kwargs = dict(kwargs)
             fallback_kwargs.pop("reply_markup", None)
-            return fallback_func(**fallback_kwargs)
+            return await call_telegram(fallback_func, **fallback_kwargs)
         raise
 
 def cleanup_paths(paths):
@@ -592,185 +1124,244 @@ def cleanup_paths(paths):
         if path and os.path.exists(path):
             safe_remove(path)
 
-def send_media_group_with_fallback(client, messages, destination, custom_caption, processed, total):
-    files_to_remove = []
-    thumbs_to_remove = []
+async def build_reply_to(client, destination):
+    return await pyrogram.utils.get_reply_to(
+        client=client,
+        chat_id=destination["chat_id"],
+        message_thread_id=destination.get("thread_id"),
+    )
+
+async def send_preuploaded_single_media(client, destination, item):
+    reply_markup = get_reply_markup(item.first_message)
+    rpc = raw.functions.messages.SendMedia(
+        peer=await client.resolve_peer(destination["chat_id"]),
+        media=item.remote_media,
+        reply_to=await build_reply_to(client, destination),
+        random_id=client.rnd_id(),
+        reply_markup=await reply_markup.write(client) if reply_markup else None,
+        message=item.caption_text or "",
+        entities=None,
+    )
 
     try:
-        media_group = []
-        for index, message in enumerate(messages):
-            refreshed_message = refresh_message(client, message)
-            media = refreshed_message.photo or refreshed_message.video or refreshed_message.audio or refreshed_message.document
-            print_stage(processed, total, message.id, f"baixando item {index + 1}/{len(messages)} do album")
-            file_name, refreshed_message = download_media_with_retry(
-                client,
-                refreshed_message,
-                file_name=get_cleaned_file_path(media, download_path, message.id),
-                progress_callback=build_progress_callback(
-                    processed,
-                    total,
-                    message.id,
-                    f"baixando item {index + 1}/{len(messages)} do album",
-                ),
+        await call_telegram(client.invoke, rpc)
+    except Exception as error:
+        if "REPLY_MARKUP_INVALID" in str(error).upper() and reply_markup:
+            rpc.reply_markup = None
+            await call_telegram(client.invoke, rpc)
+        else:
+            raise
+
+async def send_preuploaded_album(client, destination, item):
+    multi_media = []
+    for index, media in enumerate(item.remote_media_group):
+        multi_media.append(
+            raw.types.InputSingleMedia(
+                media=media,
+                random_id=client.rnd_id(),
+                message=item.caption_text if index == 0 else "",
+                entities=None,
             )
-            files_to_remove.append(file_name)
+        )
 
-            caption_text = get_caption(refreshed_message, custom_caption) if index == 0 else ""
-            input_media = build_input_media(refreshed_message, file_name, caption_text)
+    rpc = raw.functions.messages.SendMultiMedia(
+        peer=await client.resolve_peer(destination["chat_id"]),
+        multi_media=multi_media,
+        reply_to=await build_reply_to(client, destination),
+    )
+    await call_telegram(client.invoke, rpc)
 
-            thumb = getattr(input_media, "thumb", None)
-            if thumb:
-                thumbs_to_remove.append(thumb)
-            media_group.append(input_media)
-
-        print_stage(processed, total, messages[0].id, f"enviando album com {len(messages)} item(ns)")
-        kwargs = {
-            "chat_id": destination["chat_id"],
-            "media": media_group,
-        }
-        if destination.get("thread_id"):
-            kwargs["message_thread_id"] = destination["thread_id"]
-        client.send_media_group(**kwargs)
-        return True
-    finally:
-        cleanup_paths(thumbs_to_remove)
-        cleanup_paths(files_to_remove)
-
-def fallback_send_media(client, message, destination, final_caption, processed, total):
-    file_name = None
-    media_caption, overflow_text = split_caption_for_media(final_caption)
+async def send_downloaded_message(client, item, destination, custom_caption):
+    message = item.first_message
     reply_markup = get_reply_markup(message)
 
+    if message.text:
+        links_from_buttons = extract_links_from_buttons(message.reply_markup)
+        text_with_links = (message.text + ' ' + links_from_buttons).strip()
+        if custom_caption:
+            text_with_links = f"{custom_caption} {text_with_links}".strip()
+        await safe_send_with_buttons(
+            client.send_message,
+            fallback_func=client.send_message,
+            chat_id=destination["chat_id"],
+            text=text_with_links,
+            reply_markup=reply_markup,
+            message_thread_id=destination.get("thread_id"),
+        )
+        return
+
+    await send_preuploaded_single_media(client, destination, item)
+    await send_overflow_text(client, destination, item.overflow_text)
+
+async def download_item(download_client, context, item, worker_id):
+    item.download_started_at = time.time()
+    item.state = "downloading"
+
+    prefix = f"[DL{worker_id}]"
+    if item.estimated_bytes > context.budget.max_bytes:
+        await log_context(
+            context,
+            f"{prefix} {item.label}: aguardou exclusividade por exceder {format_bytes(context.budget.max_bytes)}.",
+        )
+
+    await log_context(
+        context,
+        f"{prefix} {item.label}: baixando {item.media_kind} | reserva {format_bytes(item.estimated_bytes)} | orcamento {format_budget_usage(context)}",
+    )
+
     try:
-        if message.photo:
-            print_stage(processed, total, message.id, f"baixando foto ({format_bytes(message.photo.file_size)})")
-            file_name, message = download_media_with_retry(
-                client,
-                refresh_message(client, message),
-                get_cleaned_file_path(message.photo, download_path, message.id),
-                progress_callback=build_progress_callback(processed, total, message.id, "baixando foto"),
-            )
-            print_stage(processed, total, message.id, "enviando foto")
-            safe_send_with_buttons(
-                client.send_photo,
-                fallback_func=client.send_photo,
-                chat_id=destination["chat_id"],
-                photo=file_name,
-                caption=media_caption,
-                progress=build_progress_callback(processed, total, message.id, "enviando foto"),
-                reply_markup=reply_markup,
-                message_thread_id=destination.get("thread_id"),
-            )
-            send_overflow_text(client, destination, overflow_text, processed, total, message.id)
-        elif message.audio:
-            print_stage(processed, total, message.id, f"baixando audio ({format_bytes(message.audio.file_size)})")
-            file_name, message = download_media_with_retry(
-                client,
-                refresh_message(client, message),
-                get_cleaned_file_path(message.audio, download_path, message.id),
-                progress_callback=build_progress_callback(processed, total, message.id, "baixando audio"),
-            )
-            print_stage(processed, total, message.id, "enviando audio")
-            safe_send_with_buttons(
-                client.send_audio,
-                fallback_func=client.send_audio,
-                chat_id=destination["chat_id"],
-                audio=file_name,
-                caption=media_caption,
-                progress=build_progress_callback(processed, total, message.id, "enviando audio"),
-                reply_markup=reply_markup,
-                message_thread_id=destination.get("thread_id"),
-            )
-            send_overflow_text(client, destination, overflow_text, processed, total, message.id)
-        elif message.video:
-            file_name, message = download_media_with_retry(
-                client,
-                refresh_message(client, message),
-                get_cleaned_file_path(message.video, download_path, message.id),
-                progress_callback=build_progress_callback(processed, total, message.id, "baixando video"),
-            )
-            send_video_with_metadata(
-                client,
-                destination,
-                message,
-                media_caption,
-                file_name,
-                build_progress_callback(processed, total, message.id, "enviando video"),
-            )
-            send_overflow_text(client, destination, overflow_text, processed, total, message.id)
-        elif message.document:
-            print_stage(processed, total, message.id, f"baixando arquivo ({format_bytes(message.document.file_size)})")
-            file_name, message = download_media_with_retry(
-                client,
-                refresh_message(client, message),
-                get_cleaned_file_path(message.document, download_path, message.id),
-                progress_callback=build_progress_callback(processed, total, message.id, "baixando arquivo"),
-            )
-            print_stage(processed, total, message.id, "enviando arquivo")
-            safe_send_with_buttons(
-                client.send_document,
-                fallback_func=client.send_document,
-                chat_id=destination["chat_id"],
-                document=file_name,
-                caption=media_caption,
-                progress=build_progress_callback(processed, total, message.id, "enviando arquivo"),
-                reply_markup=reply_markup,
-                message_thread_id=destination.get("thread_id"),
-            )
-            send_overflow_text(client, destination, overflow_text, processed, total, message.id)
-        elif message.sticker:
-            print_stage(processed, total, message.id, "baixando sticker")
-            file_name, message = download_media_with_retry(
-                client,
-                refresh_message(client, message),
-                get_cleaned_file_path(message.sticker, download_path, message.id),
-                progress_callback=build_progress_callback(processed, total, message.id, "baixando sticker"),
-            )
-            print_stage(processed, total, message.id, "enviando sticker")
-            sticker_kwargs = {
-                "chat_id": destination["chat_id"],
-                "sticker": file_name,
-            }
-            if destination.get("thread_id"):
-                sticker_kwargs["message_thread_id"] = destination["thread_id"]
-            client.send_sticker(**sticker_kwargs)
-            send_overflow_text(client, destination, overflow_text, processed, total, message.id)
-        elif message.animation:
-            print_stage(processed, total, message.id, f"baixando animacao ({format_bytes(message.animation.file_size)})")
-            file_name, message = download_media_with_retry(
-                client,
-                refresh_message(client, message),
-                get_cleaned_file_path(message.animation, download_path, message.id),
-                progress_callback=build_progress_callback(processed, total, message.id, "baixando animacao"),
-            )
-            print_stage(processed, total, message.id, "enviando animacao")
-            safe_send_with_buttons(
-                client.send_animation,
-                fallback_func=client.send_animation,
-                chat_id=destination["chat_id"],
-                animation=file_name,
-                caption=media_caption,
-                progress=build_progress_callback(processed, total, message.id, "enviando animacao"),
-                reply_markup=reply_markup,
-                message_thread_id=destination.get("thread_id"),
-            )
-            send_overflow_text(client, destination, overflow_text, processed, total, message.id)
-        elif message.text:
-            print_stage(processed, total, message.id, "enviando texto")
-            safe_send_with_buttons(
-                client.send_message,
-                fallback_func=client.send_message,
-                chat_id=destination["chat_id"],
-                text=final_caption or message.text,
-                reply_markup=reply_markup,
-                message_thread_id=destination.get("thread_id"),
-            )
+        if item.kind == "album":
+            refreshed_messages = []
+            local_paths = []
+            for message in item.messages:
+                file_name, refreshed_message = await download_media_with_retry(
+                    download_client,
+                    message,
+                    get_cleaned_file_path(get_message_media(message), download_path, message.id),
+                )
+                refreshed_messages.append(refreshed_message)
+                local_paths.append(file_name)
+            item.messages = refreshed_messages
+            item.local_paths = local_paths
         else:
-            return False
-        return True
+            message = item.first_message
+            if not message.text:
+                file_name, refreshed_message = await download_media_with_retry(
+                    download_client,
+                    message,
+                    get_cleaned_file_path(get_message_media(message), download_path, message.id),
+                )
+                item.messages = [refreshed_message]
+                item.local_paths = [file_name]
+
+        item.download_finished_at = time.time()
+        actual_bytes = measure_paths_size(item.local_paths)
+        await context.budget.adjust_after_download(item, actual_bytes)
+        await log_context(
+            context,
+            f"{prefix} {item.label}: download concluido em {format_phase_duration(item.download_started_at, item.download_finished_at)} | disco {format_budget_usage(context)}",
+        )
+        item.state = "downloaded"
+        await log_context(
+            context,
+            f"[QUEUE] {item.label}: entrou na fila de pre-upload | lane {queue_lane_label(context, item)} | disco {format_budget_usage(context)}",
+        )
+        await enqueue_preupload_item(context, item)
+    except Exception as error:
+        cleanup_paths(item.local_paths)
+        cleanup_paths(item.aux_paths)
+        item.local_paths = []
+        item.aux_paths = []
+        item.error = simplify_error(error)
+        item.state = "failed"
+        item.download_finished_at = time.time()
+        await context.budget.release(item)
+        await log_context(context, f"{prefix} {item.label}: falhou no download porque {item.error}")
     finally:
-        if file_name and os.path.exists(file_name):
-            safe_remove(file_name)
+        if item.state == "failed":
+            async with context.ready_condition:
+                context.ready_items[item.seq] = item
+                context.ready_condition.notify_all()
+            await schedule_more_items(context)
+            await notify_pipeline_slots(context)
+
+async def downloader_loop(download_client, context, worker_id):
+    while True:
+        _, item = await context.download_queue.get()
+        acquired_background_slot = False
+        try:
+            if item is None:
+                return
+            acquired_background_slot = await acquire_background_slot(context, "download", item)
+            waited_for_budget = await context.budget.reserve(item)
+            if waited_for_budget:
+                await log_context(
+                    context,
+                    f"[DL{worker_id}] {item.label}: orcamento liberado, retomando download | disco {format_budget_usage(context)}",
+                )
+            await download_item(download_client, context, item, worker_id)
+        finally:
+            await release_background_slot(context, "download", acquired_background_slot)
+            context.download_queue.task_done()
+
+async def preuploader_loop(preupload_client, context, worker_id):
+    destination_peer = await preupload_client.resolve_peer(context.destination["chat_id"])
+    while True:
+        _, item = await context.preupload_queue.get()
+        acquired_background_slot = False
+        try:
+            if item is None:
+                return
+            acquired_background_slot = await acquire_background_slot(context, "preupload", item)
+            await log_context(
+                context,
+                f"[PRE{worker_id}] {item.label}: iniciando pre-upload | lane {queue_lane_label(context, item)}",
+            )
+            await preupload_item(preupload_client, destination_peer, context, item, worker_id)
+        finally:
+            await release_background_slot(context, "preupload", acquired_background_slot)
+            context.preupload_queue.task_done()
+
+async def send_item(client, context, item):
+    item.send_started_at = time.time()
+    await log_context(
+        context,
+        f"[PUB] {item.label}: enviando {item.media_kind} | pronto {format_budget_usage(context)}",
+    )
+
+    if item.kind == "album":
+        await send_preuploaded_album(client, context.destination, item)
+        await send_overflow_text(client, context.destination, item.overflow_text)
+    else:
+        await send_downloaded_message(client, item, context.destination, context.custom_caption)
+
+    item.send_finished_at = time.time()
+
+async def log_item_completion(context, item, success):
+    processed = context.success_count + context.failure_count
+    elapsed = time.time() - context.started_at
+    remaining = max(0, context.total_items - processed)
+    eta = format_seconds((elapsed / processed) * remaining) if processed else "--:--"
+    status = "OK" if success else "ERRO"
+    extra = f" | motivo: {item.error}" if item.error else ""
+    await log_context(
+        context,
+        f"[{processed}/{context.total_items}] {status} | restantes: {remaining} | "
+        f"decorrido: {format_seconds(elapsed)} | ETA: {eta} | disco: {format_budget_usage(context)} | "
+        f"down: {format_phase_duration(item.download_started_at, item.download_finished_at)} | "
+        f"pre-up: {format_phase_duration(item.preupload_started_at, item.preupload_finished_at)} | "
+        f"up: {format_phase_duration(item.send_started_at, item.send_finished_at)} | {item.label}{extra}",
+    )
+
+async def publisher_loop(client, context):
+    while context.next_seq_to_publish <= context.total_items:
+        async with context.ready_condition:
+            while context.next_seq_to_publish not in context.ready_items:
+                await context.ready_condition.wait()
+            item = context.ready_items.pop(context.next_seq_to_publish)
+
+        try:
+            if item.state == "failed":
+                context.failure_count += 1
+                await log_item_completion(context, item, False)
+            else:
+                await send_item(client, context, item)
+                save_progress(context.progress_file, item.last_message_id)
+                item.state = "done"
+                context.success_count += 1
+                await log_item_completion(context, item, True)
+        except Exception as error:
+            item.error = simplify_error(error)
+            item.state = "failed"
+            item.send_finished_at = time.time()
+            context.failure_count += 1
+            await log_item_completion(context, item, False)
+        finally:
+            item.aux_paths = []
+            item.local_paths = []
+            context.next_seq_to_publish += 1
+            await schedule_more_items(context)
+            await notify_pipeline_slots(context)
 
 def clean_filename(filename):
     unsupported_chars = '<>:"/\\|?#{}[]*'  
@@ -814,34 +1405,6 @@ def choose_resume_mode(progress_file, last_processed_msg_id):
     print("Progresso antigo ignorado. O envio vai recomecar do inicio.")
     return None
 
-def forward_message(client, message, destination, progress_file, custom_caption, processed, total):
-    try:
-        links_from_buttons = extract_links_from_buttons(message.reply_markup)
-        final_caption = get_caption(message, custom_caption)
-
-        if message.text:
-            text_with_links = (message.text + ' ' + links_from_buttons).strip()
-            if custom_caption:
-                text_with_links = f"{custom_caption} {text_with_links}".strip()
-            print_stage(processed, total, message.id, "enviando texto")
-            safe_send_with_buttons(
-                client.send_message,
-                fallback_func=client.send_message,
-                chat_id=destination["chat_id"],
-                text=text_with_links,
-                reply_markup=get_reply_markup(message),
-                message_thread_id=destination.get("thread_id"),
-            )
-        else:
-            if not fallback_send_media(client, message, destination, final_caption, processed, total):
-                raise RuntimeError("Tipo de mensagem não suportado para reenvio.")
-          
-        save_progress(progress_file, message.id)
-        return True, f"Mensagem {message.id} ({media_kind_label(message)})"
-    except Exception as e:
-        print(f"Mensagem {message.id}: falhou porque {simplify_error(e)}")
-        return False, f"Mensagem {message.id} ({media_kind_label(message)})"
-
 def build_work_queue(messages, choices):
     queue = []
     i = 0
@@ -866,63 +1429,162 @@ def build_work_queue(messages, choices):
         i += 1
     return queue
 
-def forward_messages_from_channel(choices, channel_source, destination, chat_title):
-    custom_caption = get_custom_caption()  # Pegue a legenda personalizada do usuário
-    with Client(session_name) as client:
-        progress_file = generate_progress_filename(channel_source, destination, chat_title)
-        last_processed_msg_id = get_previous_progress(progress_file)
-        last_processed_msg_id = choose_resume_mode(progress_file, last_processed_msg_id)
-        all_messages = list(client.get_chat_history(channel_source))
-        
-        if last_processed_msg_id:
-            print(f"Retomando a partir da mensagem seguinte ao ID {last_processed_msg_id}.")
-            all_messages = [msg for msg in all_messages if msg.id > last_processed_msg_id]
-        else:
-            print("Iniciando do começo do canal.")
-        all_messages.reverse()
-        work_queue = build_work_queue(all_messages, choices)
-        total_items = len(work_queue)
-        success_count = 0
-        failure_count = 0
-        started_at = time.time()
+async def forward_messages_from_channel(choices, channel_source, destination, chat_title):
+    custom_caption = get_custom_caption()
+    progress_file = generate_progress_filename(channel_source, destination, chat_title)
+    last_processed_msg_id = get_previous_progress(progress_file)
+    last_processed_msg_id = choose_resume_mode(progress_file, last_processed_msg_id)
 
-        print(
-            f"Iniciando reenvio de {total_items} item(ns) "
-            f"do canal '{chat_title}' para {destination['chat_id']} ({destination['mode_label']})."
-        )
+    async with Client(
+        session_name,
+        no_updates=True,
+        sleep_threshold=30,
+        max_concurrent_transmissions=UPLOAD_CLIENT_MAX_CONCURRENT_TRANSMISSIONS,
+    ) as upload_client:
+        session_string = await upload_client.export_session_string()
+        def build_download_client(client_name, takeout):
+            return Client(
+                client_name,
+                session_string=session_string,
+                in_memory=True,
+                no_updates=True,
+                takeout=takeout,
+                sleep_threshold=30,
+                max_concurrent_transmissions=DOWNLOAD_CLIENT_MAX_CONCURRENT_TRANSMISSIONS,
+            )
 
-        for index, (kind, payload) in enumerate(work_queue, start=1):
+        def build_preupload_client(client_name):
+            return Client(
+                client_name,
+                session_string=session_string,
+                in_memory=True,
+                no_updates=True,
+                sleep_threshold=30,
+                max_concurrent_transmissions=PREUPLOAD_CLIENT_MAX_CONCURRENT_TRANSMISSIONS,
+            )
+
+        async def fetch_history(client, source_chat_id):
+            await call_telegram(client.get_chat, source_chat_id)
+            return [message async for message in client.get_chat_history(source_chat_id)]
+
+        download_client = None
+        preupload_clients = []
+        download_mode = "takeout"
+
+        try:
+            while True:
+                download_client = build_download_client(
+                    f"{session_name}_download_runtime",
+                    takeout=True,
+                )
+                try:
+                    await download_client.start()
+                    break
+                except TakeoutInitDelay as error:
+                    try:
+                        await download_client.stop()
+                    except Exception:
+                        pass
+                    download_client = None
+
+                    wait_seconds = getattr(error, "value", None)
+                    print("O Telegram exige confirmacao de exportacao no celular para usar o modo takeout.")
+                    if wait_seconds:
+                        print(f"Se nada for confirmado, o Telegram informou uma espera de {wait_seconds} segundo(s).")
+                    print("1 - Vou confirmar no celular agora e tentar takeout novamente")
+                    print("2 - Continuar com download normal")
+                    print("3 - Cancelar")
+                    choice = input("Escolha (1/2/3): ").strip() or "1"
+
+                    if choice == "1":
+                        input("Confirme a exportacao no celular e pressione Enter para tentar novamente.")
+                        continue
+                    if choice == "2":
+                        download_client = build_download_client(
+                            f"{session_name}_download_runtime_fallback",
+                            takeout=False,
+                        )
+                        await download_client.start()
+                        download_mode = "normal"
+                        print("Continuando no modo normal de download.")
+                        break
+                    raise RuntimeError("Clonagem cancelada pelo usuario.")
+
+            await call_telegram(download_client.get_chat, channel_source)
+            all_messages = await fetch_history(upload_client, channel_source)
+
+            if last_processed_msg_id:
+                print(f"Retomando a partir da mensagem seguinte ao ID {last_processed_msg_id}.")
+                all_messages = [msg for msg in all_messages if msg.id > last_processed_msg_id]
+            else:
+                print("Iniciando do começo do canal.")
+
+            all_messages.reverse()
+            work_items = build_work_items(all_messages, choices)
+
+            context = CloneJobContext(
+                channel_source=channel_source,
+                destination=destination,
+                chat_title=chat_title,
+                custom_caption=custom_caption,
+                progress_file=progress_file,
+                work_items=work_items,
+                budget=BudgetManager(MAX_TEMP_BYTES_PER_JOB),
+                download_queue=asyncio.PriorityQueue(),
+                preupload_queue=asyncio.PriorityQueue(),
+                destination_peer=await upload_client.resolve_peer(destination["chat_id"]),
+                total_items=len(work_items),
+                started_at=time.time(),
+            )
+
+            await schedule_more_items(context)
+
+            for worker_id in range(1, PREUPLOAD_WORKERS + 1):
+                preupload_client = build_preupload_client(f"{session_name}_preupload_runtime_{worker_id}")
+                await preupload_client.start()
+                preupload_clients.append(preupload_client)
+
+            print(
+                f"Iniciando reenvio de {context.total_items} item(ns) "
+                f"do canal '{chat_title}' para {destination['chat_id']} ({destination['mode_label']}). "
+                f"Downloaders: {DOWNLOAD_WORKERS} | Limite por job: {format_bytes(MAX_TEMP_BYTES_PER_JOB)} | "
+                f"Pre-uploaders: {PREUPLOAD_WORKERS} | Janela: {SCHEDULE_LOOKAHEAD} | Download: {download_mode}"
+            )
+
+            downloaders = [
+                asyncio.create_task(downloader_loop(download_client, context, worker_id))
+                for worker_id in range(1, DOWNLOAD_WORKERS + 1)
+            ]
+            preuploaders = [
+                asyncio.create_task(preuploader_loop(preupload_client, context, worker_id))
+                for worker_id, preupload_client in enumerate(preupload_clients, start=1)
+            ]
+            publisher = asyncio.create_task(publisher_loop(upload_client, context))
+
+            await publisher
+
+            for _ in range(DOWNLOAD_WORKERS):
+                await context.download_queue.put((float("inf"), None))
+            await asyncio.gather(*downloaders)
+
+            for _ in range(PREUPLOAD_WORKERS):
+                await context.preupload_queue.put((float("inf"), None))
+            await asyncio.gather(*preuploaders)
+
+            print(
+                f"Tarefa concluída. Sucessos: {context.success_count} | "
+                f"Falhas: {context.failure_count} | Total: {context.total_items}"
+            )
+        finally:
             try:
-                if kind == "album":
-                    print_stage(index, total_items, payload[0].id, f"baixando album com {len(payload)} item(ns)")
-                    send_media_group_with_fallback(client, payload, destination, custom_caption, index, total_items)
-                    save_progress(progress_file, payload[-1].id)
-                    success_count += 1
-                    print_overall_progress(
-                        index,
-                        total_items,
-                        started_at,
-                        f"Album {getattr(payload[0], 'media_group_id', 'sem_id')} reenviado",
-                        True,
-                    )
-                else:
-                    success, label = forward_message(client, payload, destination, progress_file, custom_caption, index, total_items)
-                    if success:
-                        success_count += 1
-                    else:
-                        failure_count += 1
-                    print_overall_progress(index, total_items, started_at, label, success)
-            except Exception as e:
-                failure_count += 1
-                label = f"Album {getattr(payload[0], 'media_group_id', 'sem_id')}" if kind == "album" else f"Mensagem {payload.id}"
-                print(f"{label}: falhou porque {simplify_error(e)}")
-                print_overall_progress(index, total_items, started_at, label, False)
-            time.sleep(2)
-
-        print(
-            f"Tarefa concluída. Sucessos: {success_count} | "
-            f"Falhas: {failure_count} | Total: {total_items}"
-        )
+                await download_client.stop()
+            except Exception:
+                pass
+            for preupload_client in preupload_clients:
+                try:
+                    await preupload_client.stop()
+                except Exception:
+                    pass
 
 def cleanup_asyncio_warnings():
     try:
@@ -975,7 +1637,7 @@ if __name__ == "__main__":
             )
         )
         choices = get_user_choices()
-        forward_messages_from_channel(choices, channel_source, destination, chat_title)
+        asyncio.run(forward_messages_from_channel(choices, channel_source, destination, chat_title))
     finally:
         cleanup_runtime_state()
         cleanup_asyncio_warnings()
