@@ -5,7 +5,19 @@ import asyncio
 from pathlib import Path
 import subprocess
 from tqdm import tqdm
-from utils import Banner, show_banner, cache_path, authenticate
+from utils import (
+    Banner,
+    show_banner,
+    cache_path,
+    authenticate,
+    acquire_available_session,
+    acquire_runtime_lock,
+    release_runtime_lock,
+    build_run_id,
+    create_run_download_dir,
+    cleanup_run_download_dir,
+    build_lock_name,
+)
 import re
 import shutil
 
@@ -22,6 +34,9 @@ from pyrogram.types import InputMediaAudio, InputMediaDocument, InputMediaPhoto,
 """ Global """
 session_name = "user"
 video_path = 'downloads'
+runtime_lock_path = None
+task_lock_path = None
+run_download_path = None
 
 def resolve_binary(executable_name):
     local_path = os.path.join("tools", "ffmpeg", "bin", executable_name)
@@ -258,7 +273,7 @@ def get_json_filepath(channel_source, channel_target, chat_title):
     return f"downloaded_media_{chat_title}_{channel_source}_{channel_target}.json"
 
 def get_json_filepath(channel_source, channel_target, chat_title):
-    filename = f"downloaded_media_{chat_title}_{channel_source}_{channel_target}.json"
+    filename = f"downloaded_media_{session_name}_{chat_title}_{channel_source}_{channel_target}.json"
     cleaned_filename = clean_filename(filename)
     return os.path.join('download_tasks', cleaned_filename)
 
@@ -396,9 +411,21 @@ def download_and_upload_media_from_channel(choices, channel_source, channel_targ
         print("Tarefa concluida e log salvo no arquivo JSON.")
 
 if __name__ == "__main__":
-    show_banner()
-    cache_path()
-    authenticate()
-    channel_source, channel_target, chat_title = get_channels()
-    choices = get_user_choices()
-    download_and_upload_media_from_channel(choices, channel_source, channel_target, chat_title)
+    try:
+        show_banner()
+        cache_path()
+        session_name, runtime_lock_path = acquire_available_session(lock_prefix="session_forward")
+        authenticate(session_name)
+        run_id = build_run_id("mirror")
+        run_download_path = create_run_download_dir(run_id)
+        video_path = run_download_path
+        channel_source, channel_target, chat_title = get_channels()
+        task_lock_path = acquire_runtime_lock(
+            build_lock_name("task_mirror", channel_source, channel_target, chat_title)
+        )
+        choices = get_user_choices()
+        download_and_upload_media_from_channel(choices, channel_source, channel_target, chat_title)
+    finally:
+        cleanup_run_download_dir(run_download_path)
+        release_runtime_lock(task_lock_path)
+        release_runtime_lock(runtime_lock_path)

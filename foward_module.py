@@ -7,7 +7,20 @@ import warnings
 import re
 import subprocess
 import shutil
-from utils import Banner, show_banner, cache_path, authenticate
+import random
+from utils import (
+    Banner,
+    show_banner,
+    cache_path,
+    authenticate,
+    acquire_available_session,
+    acquire_runtime_lock,
+    release_runtime_lock,
+    build_run_id,
+    create_run_download_dir,
+    cleanup_run_download_dir,
+    build_lock_name,
+)
 
 try:
     asyncio.get_event_loop()
@@ -15,6 +28,7 @@ except RuntimeError:
     asyncio.set_event_loop(asyncio.new_event_loop())
 
 from pyrogram import Client
+from pyrogram import raw
 from pyrogram.types import InputMediaAudio, InputMediaDocument, InputMediaPhoto, InputMediaVideo
 import pyrogram
 
@@ -22,6 +36,9 @@ import pyrogram
 session_name = "user"
 download_path = "downloads"
 MEDIA_CAPTION_LIMIT = 1024
+runtime_lock_path = None
+task_lock_path = None
+run_download_path = None
 
 def resolve_binary(executable_name):
     local_path = os.path.join("tools", "ffmpeg", "bin", executable_name)
@@ -29,6 +46,119 @@ def resolve_binary(executable_name):
 
 FFMPEG_PATH = resolve_binary("ffmpeg.exe")
 FFPROBE_PATH = resolve_binary("ffprobe.exe")
+
+def normalize_topic_title(title):
+    title = (title or "Topico").strip()
+    return title[:128] or "Topico"
+
+def create_forum_topic(client, target_chat_id, topic_title):
+    topic_title = normalize_topic_title(topic_title)
+    input_channel = client.resolve_peer(target_chat_id)
+
+    client.invoke(
+        raw.functions.channels.CreateForumTopic(
+            channel=input_channel,
+            title=topic_title,
+            random_id=random.getrandbits(64),
+            icon_color=0x6FB9F0,
+        )
+    )
+
+    forum_topics = client.invoke(
+        raw.functions.channels.GetForumTopics(
+            channel=input_channel,
+            offset_date=0,
+            offset_id=0,
+            offset_topic=0,
+            limit=100,
+            q=topic_title,
+        )
+    )
+
+    matches = [topic for topic in forum_topics.topics if getattr(topic, "title", None) == topic_title]
+    if not matches:
+        raise RuntimeError("Nao foi possivel localizar o topico criado no grupo de destino.")
+
+    return max(matches, key=lambda topic: getattr(topic, "id", 0)).id
+
+def extract_migrated_supergroup_id(updates):
+    for chat in reversed(getattr(updates, "chats", [])):
+        channel_id = getattr(chat, "id", None)
+        if channel_id is not None:
+            return pyrogram.utils.get_channel_id(channel_id)
+    raise RuntimeError("Nao foi possivel identificar o supergrupo criado apos a migracao do grupo.")
+
+def migrate_group_to_supergroup(client, target_chat):
+    updates = client.invoke(
+        raw.functions.messages.MigrateChat(
+            chat_id=abs(target_chat.id),
+        )
+    )
+    migrated_chat_id = extract_migrated_supergroup_id(updates)
+    time.sleep(1)
+    return client.get_chat(migrated_chat_id)
+
+def resolve_target_destination(client, source_chat, target_chat):
+    destination = {
+        "chat_id": target_chat.id,
+        "thread_id": None,
+        "mode_label": "chat",
+    }
+
+    if target_chat.type == pyrogram.enums.ChatType.CHANNEL:
+        return destination
+
+    if target_chat.type == pyrogram.enums.ChatType.GROUP:
+        print("O destino escolhido e um grupo basico.")
+        print("1 - Continuar clonando no grupo em si")
+        print("2 - Converter para supergrupo e depois decidir sobre topicos")
+        print("3 - Cancelar")
+        choice = input("Escolha (1/2/3): ").strip() or "1"
+        if choice == "1":
+            print("O envio sera feito para o grupo em si, sem topico.")
+            return destination
+        if choice == "3":
+            raise RuntimeError("Envio cancelado pelo usuario.")
+
+        migrated_chat = migrate_group_to_supergroup(client, target_chat)
+        print(f"Grupo convertido para supergrupo: {migrated_chat.id}")
+        target_chat = migrated_chat
+        destination["chat_id"] = migrated_chat.id
+
+    if target_chat.type != pyrogram.enums.ChatType.SUPERGROUP:
+        print("Destino sem suporte a topicos. O envio sera feito para o chat em si.")
+        return destination
+
+    source_title = source_chat.title or "Topico"
+
+    if getattr(target_chat, "is_forum", False):
+        topic_id = create_forum_topic(client, target_chat.id, source_title)
+        destination["thread_id"] = topic_id
+        destination["mode_label"] = f"topico:{topic_id}"
+        print(f"Topico criado automaticamente no grupo de destino: '{normalize_topic_title(source_title)}' (ID {topic_id}).")
+        return destination
+
+    print("O grupo de destino ainda nao esta usando topicos.")
+    print("1 - Clonar no grupo em si")
+    print("2 - Ativar topicos e criar o primeiro topico com o nome da origem")
+    choice = input("Escolha (1/2): ").strip() or "1"
+
+    if choice == "2":
+        input_channel = client.resolve_peer(target_chat.id)
+        client.invoke(
+            raw.functions.channels.ToggleForum(
+                channel=input_channel,
+                enabled=True,
+            )
+        )
+        topic_id = create_forum_topic(client, target_chat.id, source_title)
+        destination["thread_id"] = topic_id
+        destination["mode_label"] = f"topico:{topic_id}"
+        print(f"Forum ativado e topico criado: '{normalize_topic_title(source_title)}' (ID {topic_id}).")
+        return destination
+
+    print("O envio sera feito para o grupo em si, sem topico.")
+    return destination
 
 def get_channels():
     with Client(session_name) as client:
@@ -38,7 +168,8 @@ def get_channels():
         channel_target = parse_channel_input(channel_target)
         source_chat = client.get_chat(channel_source)
         target_chat = client.get_chat(channel_target)
-        return source_chat.id, target_chat.id, source_chat.title
+        destination = resolve_target_destination(client, source_chat, target_chat)
+        return source_chat.id, destination, source_chat.title
 
 def parse_channel_input(channel_input: str):
     """Parse channel input to determine if it's an ID or username."""
@@ -356,14 +487,14 @@ def download_media_with_retry(client, message, file_name, attempts=2, progress_c
                 continue
             raise
 
-def send_video_with_metadata(client, channel_target, message, final_caption, file_name, progress_callback=None):
+def send_video_with_metadata(client, destination, message, final_caption, file_name, progress_callback=None):
     duration = collect_video_duration(file_name) or getattr(message.video, "duration", 0) or 0
     width = getattr(message.video, "width", None)
     height = getattr(message.video, "height", None)
     thumbnail_path = extract_thumbnail(file_name)
 
     kwargs = {
-        "chat_id": channel_target,
+        "chat_id": destination["chat_id"],
         "video": file_name,
         "caption": final_caption,
         "duration": duration,
@@ -371,6 +502,8 @@ def send_video_with_metadata(client, channel_target, message, final_caption, fil
     }
     if progress_callback:
         kwargs["progress"] = progress_callback
+    if destination.get("thread_id"):
+        kwargs["message_thread_id"] = destination["thread_id"]
     reply_markup = get_reply_markup(message)
     if reply_markup:
         kwargs["reply_markup"] = reply_markup
@@ -382,7 +515,11 @@ def send_video_with_metadata(client, channel_target, message, final_caption, fil
         kwargs["thumb"] = thumbnail_path
 
     try:
-        client.send_video(**kwargs)
+        safe_send_with_buttons(
+            client.send_video,
+            fallback_func=client.send_video,
+            **kwargs,
+        )
     finally:
         if thumbnail_path and os.path.exists(thumbnail_path):
             safe_remove(thumbnail_path)
@@ -428,11 +565,17 @@ def build_input_media(message, file_name, caption_text):
         return InputMediaDocument(media=file_name, caption=caption_text or "")
     raise RuntimeError("Tipo de mídia não suportado em álbum.")
 
-def send_overflow_text(client, channel_target, overflow_text, processed, total, message_id):
+def send_overflow_text(client, destination, overflow_text, processed, total, message_id):
     if not overflow_text:
         return
     print_stage(processed, total, message_id, "enviando texto complementar")
-    client.send_message(channel_target, overflow_text)
+    kwargs = {
+        "chat_id": destination["chat_id"],
+        "text": overflow_text,
+    }
+    if destination.get("thread_id"):
+        kwargs["message_thread_id"] = destination["thread_id"]
+    client.send_message(**kwargs)
 
 def safe_send_with_buttons(send_func, fallback_func=None, **kwargs):
     try:
@@ -449,7 +592,7 @@ def cleanup_paths(paths):
         if path and os.path.exists(path):
             safe_remove(path)
 
-def send_media_group_with_fallback(client, messages, channel_target, custom_caption, processed, total):
+def send_media_group_with_fallback(client, messages, destination, custom_caption, processed, total):
     files_to_remove = []
     thumbs_to_remove = []
 
@@ -481,13 +624,19 @@ def send_media_group_with_fallback(client, messages, channel_target, custom_capt
             media_group.append(input_media)
 
         print_stage(processed, total, messages[0].id, f"enviando album com {len(messages)} item(ns)")
-        client.send_media_group(channel_target, media_group)
+        kwargs = {
+            "chat_id": destination["chat_id"],
+            "media": media_group,
+        }
+        if destination.get("thread_id"):
+            kwargs["message_thread_id"] = destination["thread_id"]
+        client.send_media_group(**kwargs)
         return True
     finally:
         cleanup_paths(thumbs_to_remove)
         cleanup_paths(files_to_remove)
 
-def fallback_send_media(client, message, channel_target, final_caption, processed, total):
+def fallback_send_media(client, message, destination, final_caption, processed, total):
     file_name = None
     media_caption, overflow_text = split_caption_for_media(final_caption)
     reply_markup = get_reply_markup(message)
@@ -505,13 +654,14 @@ def fallback_send_media(client, message, channel_target, final_caption, processe
             safe_send_with_buttons(
                 client.send_photo,
                 fallback_func=client.send_photo,
-                chat_id=channel_target,
+                chat_id=destination["chat_id"],
                 photo=file_name,
                 caption=media_caption,
                 progress=build_progress_callback(processed, total, message.id, "enviando foto"),
                 reply_markup=reply_markup,
+                message_thread_id=destination.get("thread_id"),
             )
-            send_overflow_text(client, channel_target, overflow_text, processed, total, message.id)
+            send_overflow_text(client, destination, overflow_text, processed, total, message.id)
         elif message.audio:
             print_stage(processed, total, message.id, f"baixando audio ({format_bytes(message.audio.file_size)})")
             file_name, message = download_media_with_retry(
@@ -524,13 +674,14 @@ def fallback_send_media(client, message, channel_target, final_caption, processe
             safe_send_with_buttons(
                 client.send_audio,
                 fallback_func=client.send_audio,
-                chat_id=channel_target,
+                chat_id=destination["chat_id"],
                 audio=file_name,
                 caption=media_caption,
                 progress=build_progress_callback(processed, total, message.id, "enviando audio"),
                 reply_markup=reply_markup,
+                message_thread_id=destination.get("thread_id"),
             )
-            send_overflow_text(client, channel_target, overflow_text, processed, total, message.id)
+            send_overflow_text(client, destination, overflow_text, processed, total, message.id)
         elif message.video:
             file_name, message = download_media_with_retry(
                 client,
@@ -540,13 +691,13 @@ def fallback_send_media(client, message, channel_target, final_caption, processe
             )
             send_video_with_metadata(
                 client,
-                channel_target,
+                destination,
                 message,
                 media_caption,
                 file_name,
                 build_progress_callback(processed, total, message.id, "enviando video"),
             )
-            send_overflow_text(client, channel_target, overflow_text, processed, total, message.id)
+            send_overflow_text(client, destination, overflow_text, processed, total, message.id)
         elif message.document:
             print_stage(processed, total, message.id, f"baixando arquivo ({format_bytes(message.document.file_size)})")
             file_name, message = download_media_with_retry(
@@ -559,13 +710,14 @@ def fallback_send_media(client, message, channel_target, final_caption, processe
             safe_send_with_buttons(
                 client.send_document,
                 fallback_func=client.send_document,
-                chat_id=channel_target,
+                chat_id=destination["chat_id"],
                 document=file_name,
                 caption=media_caption,
                 progress=build_progress_callback(processed, total, message.id, "enviando arquivo"),
                 reply_markup=reply_markup,
+                message_thread_id=destination.get("thread_id"),
             )
-            send_overflow_text(client, channel_target, overflow_text, processed, total, message.id)
+            send_overflow_text(client, destination, overflow_text, processed, total, message.id)
         elif message.sticker:
             print_stage(processed, total, message.id, "baixando sticker")
             file_name, message = download_media_with_retry(
@@ -575,8 +727,14 @@ def fallback_send_media(client, message, channel_target, final_caption, processe
                 progress_callback=build_progress_callback(processed, total, message.id, "baixando sticker"),
             )
             print_stage(processed, total, message.id, "enviando sticker")
-            client.send_sticker(channel_target, file_name)
-            send_overflow_text(client, channel_target, overflow_text, processed, total, message.id)
+            sticker_kwargs = {
+                "chat_id": destination["chat_id"],
+                "sticker": file_name,
+            }
+            if destination.get("thread_id"):
+                sticker_kwargs["message_thread_id"] = destination["thread_id"]
+            client.send_sticker(**sticker_kwargs)
+            send_overflow_text(client, destination, overflow_text, processed, total, message.id)
         elif message.animation:
             print_stage(processed, total, message.id, f"baixando animacao ({format_bytes(message.animation.file_size)})")
             file_name, message = download_media_with_retry(
@@ -589,21 +747,23 @@ def fallback_send_media(client, message, channel_target, final_caption, processe
             safe_send_with_buttons(
                 client.send_animation,
                 fallback_func=client.send_animation,
-                chat_id=channel_target,
+                chat_id=destination["chat_id"],
                 animation=file_name,
                 caption=media_caption,
                 progress=build_progress_callback(processed, total, message.id, "enviando animacao"),
                 reply_markup=reply_markup,
+                message_thread_id=destination.get("thread_id"),
             )
-            send_overflow_text(client, channel_target, overflow_text, processed, total, message.id)
+            send_overflow_text(client, destination, overflow_text, processed, total, message.id)
         elif message.text:
             print_stage(processed, total, message.id, "enviando texto")
             safe_send_with_buttons(
                 client.send_message,
                 fallback_func=client.send_message,
-                chat_id=channel_target,
+                chat_id=destination["chat_id"],
                 text=final_caption or message.text,
                 reply_markup=reply_markup,
+                message_thread_id=destination.get("thread_id"),
             )
         else:
             return False
@@ -619,8 +779,11 @@ def clean_filename(filename):
     filename = filename.strip().strip('.')
     return filename    
 
-def generate_progress_filename(channel_source, channel_target, chat_title):
-    filename = f"{chat_title}_{channel_source}_{channel_target}.json"
+def generate_progress_filename(channel_source, destination, chat_title):
+    filename = (
+        f"{session_name}_{chat_title}_{channel_source}_"
+        f"{destination['chat_id']}_{destination.get('thread_id') or 'chat'}.json"
+    )
     cleaned_filename = clean_filename(filename)
     return os.path.join("forward_task", cleaned_filename)
 
@@ -651,7 +814,7 @@ def choose_resume_mode(progress_file, last_processed_msg_id):
     print("Progresso antigo ignorado. O envio vai recomecar do inicio.")
     return None
 
-def forward_message(client, message, channel_target, progress_file, custom_caption, processed, total):
+def forward_message(client, message, destination, progress_file, custom_caption, processed, total):
     try:
         links_from_buttons = extract_links_from_buttons(message.reply_markup)
         final_caption = get_caption(message, custom_caption)
@@ -664,12 +827,13 @@ def forward_message(client, message, channel_target, progress_file, custom_capti
             safe_send_with_buttons(
                 client.send_message,
                 fallback_func=client.send_message,
-                chat_id=channel_target,
+                chat_id=destination["chat_id"],
                 text=text_with_links,
                 reply_markup=get_reply_markup(message),
+                message_thread_id=destination.get("thread_id"),
             )
         else:
-            if not fallback_send_media(client, message, channel_target, final_caption, processed, total):
+            if not fallback_send_media(client, message, destination, final_caption, processed, total):
                 raise RuntimeError("Tipo de mensagem não suportado para reenvio.")
           
         save_progress(progress_file, message.id)
@@ -702,10 +866,10 @@ def build_work_queue(messages, choices):
         i += 1
     return queue
 
-def forward_messages_from_channel(choices, channel_source, channel_target, chat_title):
+def forward_messages_from_channel(choices, channel_source, destination, chat_title):
     custom_caption = get_custom_caption()  # Pegue a legenda personalizada do usuário
     with Client(session_name) as client:
-        progress_file = generate_progress_filename(channel_source, channel_target, chat_title)
+        progress_file = generate_progress_filename(channel_source, destination, chat_title)
         last_processed_msg_id = get_previous_progress(progress_file)
         last_processed_msg_id = choose_resume_mode(progress_file, last_processed_msg_id)
         all_messages = list(client.get_chat_history(channel_source))
@@ -724,14 +888,14 @@ def forward_messages_from_channel(choices, channel_source, channel_target, chat_
 
         print(
             f"Iniciando reenvio de {total_items} item(ns) "
-            f"do canal '{chat_title}' para {channel_target}."
+            f"do canal '{chat_title}' para {destination['chat_id']} ({destination['mode_label']})."
         )
 
         for index, (kind, payload) in enumerate(work_queue, start=1):
             try:
                 if kind == "album":
                     print_stage(index, total_items, payload[0].id, f"baixando album com {len(payload)} item(ns)")
-                    send_media_group_with_fallback(client, payload, channel_target, custom_caption, index, total_items)
+                    send_media_group_with_fallback(client, payload, destination, custom_caption, index, total_items)
                     save_progress(progress_file, payload[-1].id)
                     success_count += 1
                     print_overall_progress(
@@ -742,7 +906,7 @@ def forward_messages_from_channel(choices, channel_source, channel_target, chat_
                         True,
                     )
                 else:
-                    success, label = forward_message(client, payload, channel_target, progress_file, custom_caption, index, total_items)
+                    success, label = forward_message(client, payload, destination, progress_file, custom_caption, index, total_items)
                     if success:
                         success_count += 1
                     else:
@@ -785,14 +949,33 @@ def cleanup_asyncio_warnings():
     except Exception:
         pass
 
+def cleanup_runtime_state():
+    cleanup_run_download_dir(run_download_path)
+    release_runtime_lock(task_lock_path)
+    release_runtime_lock(runtime_lock_path)
+
 if __name__ == "__main__":
     warnings.filterwarnings("ignore", message="coroutine 'Client.handle_updates' was never awaited")
     try:
         show_banner()
-        authenticate()
+        session_name, runtime_lock_path = acquire_available_session(lock_prefix="session_forward")
+        authenticate(session_name)
         cache_path()
-        channel_source, channel_target, chat_title = get_channels()
+        run_id = build_run_id("forward")
+        run_download_path = create_run_download_dir(run_id)
+        download_path = run_download_path
+        channel_source, destination, chat_title = get_channels()
+        task_lock_path = acquire_runtime_lock(
+            build_lock_name(
+                "task_forward",
+                channel_source,
+                destination["chat_id"],
+                destination.get("thread_id") or "chat",
+                chat_title,
+            )
+        )
         choices = get_user_choices()
-        forward_messages_from_channel(choices, channel_source, channel_target, chat_title)
+        forward_messages_from_channel(choices, channel_source, destination, chat_title)
     finally:
+        cleanup_runtime_state()
         cleanup_asyncio_warnings()

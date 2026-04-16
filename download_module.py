@@ -5,7 +5,21 @@ import shutil
 import asyncio
 from tqdm import tqdm
 import re
-from utils import limpar_nome_arquivo, Banner, show_banner, cache_path, authenticate, rename_files
+from utils import (
+    limpar_nome_arquivo,
+    Banner,
+    show_banner,
+    cache_path,
+    authenticate,
+    rename_files,
+    acquire_available_session,
+    acquire_runtime_lock,
+    release_runtime_lock,
+    build_run_id,
+    create_run_download_dir,
+    cleanup_run_download_dir,
+    build_lock_name,
+)
 
 try:
     asyncio.get_event_loop()
@@ -19,6 +33,9 @@ import pyrogram
 session_name = "user"
 video_path = 'downloads' 
 task_directory = 'chat_download_task'
+runtime_lock_path = None
+task_lock_path = None
+run_download_path = None
 
 def limpar_nome_arquivo(nome_arquivo):
     nome_limpo = re.sub(r'[^a-zA-Z0-9]', '_', nome_arquivo)
@@ -75,11 +92,11 @@ def download_progress(current, total):
 def save_last_processed_message_id(chat_title, channel_source, last_id):
     if not os.path.exists(task_directory):
         os.makedirs(task_directory)
-    with open(f"{task_directory}/{chat_title}_{channel_source}.json", 'w') as file:
+    with open(f"{task_directory}/{session_name}_{chat_title}_{channel_source}.json", 'w') as file:
         json.dump({'last_processed_id': last_id}, file)
 
 def load_last_processed_message_id(chat_title, channel_source):
-    json_filepath = f"{task_directory}/{chat_title}_{channel_source}.json"
+    json_filepath = f"{task_directory}/{session_name}_{chat_title}_{channel_source}.json"
     try:
         with open(json_filepath, "r") as json_file:
             data = json.load(json_file)
@@ -145,10 +162,20 @@ def download_media_from_channel(choices, channel_source, chat_title):
         print("Tarefa concluída.")
 
 if __name__ == "__main__":
-    show_banner()
-    cache_path()
-    authenticate()
-    channel_source, chat_title = get_channel()
-    choices = get_user_choices()
-    download_media_from_channel(choices, channel_source, chat_title)    
-    rename_files(video_path, chat_title)
+    try:
+        show_banner()
+        cache_path()
+        session_name, runtime_lock_path = acquire_available_session(lock_prefix="session_download")
+        authenticate(session_name)
+        run_id = build_run_id("download")
+        run_download_path = create_run_download_dir(run_id)
+        video_path = run_download_path
+        channel_source, chat_title = get_channel()
+        task_lock_path = acquire_runtime_lock(build_lock_name("task_download", channel_source, chat_title))
+        choices = get_user_choices()
+        download_media_from_channel(choices, channel_source, chat_title)    
+        rename_files(video_path, chat_title)
+    finally:
+        cleanup_run_download_dir(run_download_path)
+        release_runtime_lock(task_lock_path)
+        release_runtime_lock(runtime_lock_path)
