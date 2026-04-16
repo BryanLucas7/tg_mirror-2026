@@ -2,13 +2,18 @@ import os
 import time
 import json
 import shutil
-from pyrogram import Client
+import asyncio
 from tqdm import tqdm
 import re
 from utils import limpar_nome_arquivo, Banner, show_banner, cache_path, authenticate, rename_files
 
+try:
+    asyncio.get_event_loop()
+except RuntimeError:
+    asyncio.set_event_loop(asyncio.new_event_loop())
+
+from pyrogram import Client
 import pyrogram
-pyrogram.utils.MIN_CHANNEL_ID = -1002999999999
 
 """ Global """
 session_name = "user"

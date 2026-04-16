@@ -60,6 +60,16 @@ Após isso vamos instalar as dependencias com o comando:
 
 	pip install -r requirements.txt --upgrade
 
+Para instalar tudo de forma automática, incluindo o `ffmpeg` portátil dentro da pasta do projeto, você também pode usar:
+
+	powershell -ExecutionPolicy Bypass -File .\install_dependencies.ps1
+
+Observação:
+
+	`pip install -r requirements.txt` instala apenas pacotes Python.
+	`ffmpeg` e `ffprobe` são binários do sistema, então não vêm pelo pip.
+	O script `install_dependencies.ps1` baixa uma cópia portátil para `tools\ffmpeg\bin`, sem precisar de privilégio de administrador.
+
 ## Usando o script 
 
 Após ter preparado o ambiente ao abrir a pasta do script você verá alguns arquivos porém somente 3 são interressantes para a sua utilizão na prática :

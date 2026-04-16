@@ -1,9 +1,16 @@
 import os
 import re
-from pyrogram import Client
+import asyncio
 from colorama import Fore
 import pyfiglet
 import random
+
+try:
+    asyncio.get_event_loop()
+except RuntimeError:
+    asyncio.set_event_loop(asyncio.new_event_loop())
+
+from pyrogram import Client
 
 """ Global """
 session_name = "user"
