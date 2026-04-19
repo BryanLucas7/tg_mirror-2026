@@ -1,4 +1,7 @@
-# TG MIRROR 
+# TG MIRROR (Fork adaptado para 2026)
+
+> Fork de [viniped/tg_mirror](https://github.com/viniped/tg_mirror) adaptado para 2026.
+> Principais mudanças: migração de `pyrogram` para `pyrofork`, pipeline de stream relay com backpressure adaptativo baseado em `help.getAppConfig`, modo batch para clonar múltiplos canais em sequência com 60s de cooldown entre clones, terminal em modo `quiet` por padrão (logs detalhados e analytics agora são opt-in via env vars `FORWARD_DETAILED_LOG=1` e `FORWARD_ANALYTICS=1`).
 
 ## Introdução
 
