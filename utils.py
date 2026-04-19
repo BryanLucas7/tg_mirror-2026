@@ -115,6 +115,16 @@ def cleanup_run_download_dir(path):
         shutil.rmtree(path, ignore_errors=True)
     except OSError:
         pass
+    # Remove stale empty run directories left by relay-only runs
+    try:
+        runs_dir = os.path.dirname(path)
+        if os.path.isdir(runs_dir):
+            for entry in os.listdir(runs_dir):
+                entry_path = os.path.join(runs_dir, entry)
+                if os.path.isdir(entry_path) and not os.listdir(entry_path):
+                    os.rmdir(entry_path)
+    except OSError:
+        pass
 
 def _list_existing_session_names():
     names = []

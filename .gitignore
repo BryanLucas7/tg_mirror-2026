@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Pyrogram sessions (contêm credenciais!)
+*.session
+*.session-journal
+
+# Ambientes virtuais
+venv/
+.venv/
+env/
+
+# Artefatos de execução do clonador
+downloads/
+forward_task/
+runtime_locks/
+diff_temp.txt
+
+# Ferramentas locais pesadas (ffmpeg etc.)
+tools/
+
+# Configuração local do Claude Code
+.claude/
+
+# Editores / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

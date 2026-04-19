@@ -110,9 +110,10 @@ FAILED_ITEM_RETRY_BACKOFF_MAX_SECONDS = 180
 HEAD_PRESSURE_BACKGROUND_PREUPLOAD_LIMIT = 1
 HEAD_PRESSURE_READY_BACKLOG_THRESHOLD = 2
 LARGE_RELAY_DIAGNOSTIC_BYTES = 300 * 1024 * 1024
-LOG_MODE = os.getenv("FORWARD_LOG_MODE", "normal").strip().lower() or "normal"
-DETAILED_LOG_TO_FILE = os.getenv("FORWARD_DETAILED_LOG", "1").strip().lower() not in {"0", "false", "no", "off"}
+LOG_MODE = os.getenv("FORWARD_LOG_MODE", "quiet").strip().lower() or "quiet"
+DETAILED_LOG_TO_FILE = os.getenv("FORWARD_DETAILED_LOG", "0").strip().lower() not in {"0", "false", "no", "off"}
 DETAILED_LOG_DIR = os.path.abspath(os.getenv("FORWARD_LOG_DIR", os.path.join("forward_task", "logs")))
+ANALYTICS_TO_FILE = os.getenv("FORWARD_ANALYTICS", "0").strip().lower() not in {"0", "false", "no", "off"}
 PYROGRAM_SESSION_LOGGER_NAME = "pyrogram.session.session"
 ETA_FALLBACK_SECONDS_BY_KIND = {
     "video": 90.0,
@@ -950,11 +951,15 @@ def analytics_file_prefix(fingerprint):
     return f"forward_analytics_{fingerprint}_"
 
 def build_analytics_report_path(fingerprint, run_label):
+    if not ANALYTICS_TO_FILE:
+        return None
     os.makedirs(ANALYTICS_DIR, exist_ok=True)
     filename = clean_filename(f"{analytics_file_prefix(fingerprint)}{run_label}.json")
     return os.path.join(ANALYTICS_DIR, filename)
 
 def list_analytics_files_for_fingerprint(fingerprint):
+    if not ANALYTICS_TO_FILE:
+        return []
     if not os.path.isdir(ANALYTICS_DIR):
         return []
     prefix = analytics_file_prefix(fingerprint)
@@ -983,8 +988,13 @@ def load_previous_analytics_report(fingerprint):
         return None
 
 def save_analytics_report(report):
+    if not ANALYTICS_TO_FILE:
+        return
+    report_path = report.get("run", {}).get("report_path")
+    if not report_path:
+        return
     os.makedirs(ANALYTICS_DIR, exist_ok=True)
-    with open(report["run"]["report_path"], "w", encoding="utf-8") as file:
+    with open(report_path, "w", encoding="utf-8") as file:
         json.dump(report, file, ensure_ascii=False, indent=2)
 
 def resolve_binary(executable_name):
@@ -1133,6 +1143,33 @@ def get_channels():
         target_chat = client.get_chat(channel_target)
         destination = resolve_target_destination(client, source_chat, target_chat)
         return source_chat.id, destination, source_chat.title
+
+def get_batch_job_count():
+    while True:
+        raw_value = input("Quantos canais deseja clonar nesta sessão? (1-9): ").strip() or "1"
+        try:
+            count = int(raw_value)
+        except ValueError:
+            print("Valor inválido. Digite um número inteiro.")
+            continue
+        if count < 1 or count > 9:
+            print("Informe um número entre 1 e 9.")
+            continue
+        return count
+
+def collect_batch_jobs(count):
+    jobs = []
+    for index in range(count):
+        print(f"\n=== Clonagem {index + 1} de {count} ===")
+        channel_source, destination, chat_title = get_channels()
+        custom_caption = get_custom_caption()
+        jobs.append({
+            "channel_source": channel_source,
+            "destination": destination,
+            "chat_title": chat_title,
+            "custom_caption": custom_caption,
+        })
+    return jobs
 
 def parse_channel_input(channel_input: str):
     """Parse channel input to determine if it's an ID or username."""
@@ -1939,9 +1976,9 @@ def format_budget_usage(context):
     return f"{format_bytes(context.disk_budget.current_bytes())}/{format_bytes(context.disk_budget.max_bytes)}"
 
 def normalize_log_mode(value):
-    value = (value or "normal").strip().lower()
-    if value not in {"normal", "diag", "trace"}:
-        return "normal"
+    value = (value or "quiet").strip().lower()
+    if value not in {"quiet", "normal", "diag", "trace"}:
+        return "quiet"
     return value
 
 def classify_log_message(message):
@@ -1983,6 +2020,9 @@ def should_emit_console_message(context, message, category):
     lowered = message.lower()
     if "falhou" in lowered or "interrompendo job" in lowered:
         return True
+
+    if context.log_mode == "quiet":
+        return category == "PROGRESS"
 
     if context.log_mode == "diag":
         return category not in {"DL", "PRE", "QUEUE"}
@@ -3768,8 +3808,10 @@ def build_executive_summary_lines(report):
 
 def emit_executive_summary(context, report):
     lines = build_executive_summary_lines(report)
+    quiet = getattr(context, "log_mode", "normal") == "quiet"
     for line in lines:
-        print(line)
+        if not quiet:
+            print(line)
         write_detailed_log_line(context, f"[{time.strftime('%H:%M:%S')}] [SUMMARY] {line}")
 
 def get_source_reader_mode(file_size, stage_name):
@@ -5912,8 +5954,9 @@ def build_work_queue(messages, choices):
         i += 1
     return queue
 
-async def forward_messages_from_channel(choices, channel_source, destination, chat_title):
-    custom_caption = get_custom_caption()
+async def forward_messages_from_channel(choices, channel_source, destination, chat_title, custom_caption=None):
+    if custom_caption is None:
+        custom_caption = get_custom_caption()
     progress_file = generate_progress_filename(channel_source, destination, chat_title)
     last_processed_msg_id = get_previous_progress(progress_file)
     last_processed_msg_id = choose_resume_mode(progress_file, last_processed_msg_id)
@@ -6098,15 +6141,20 @@ async def forward_messages_from_channel(choices, channel_source, destination, ch
                     f"CDN origem: {'on' if SOURCE_READ_ENABLE_CDN else 'off'} | Janela: {SCHEDULE_LOOKAHEAD} | "
                     f"Download: {download_mode} | Relay engine: {STREAM_RELAY_ENGINE}"
                 )
-            print(startup_message)
+            if context.log_mode == "quiet":
+                print(f"Clonando {context.total_items} item(ns) de '{chat_title}' para {destination['chat_id']}...")
+            else:
+                print(startup_message)
             write_detailed_log_line(context, f"[{time.strftime('%H:%M:%S')}] [RUN] {startup_message}")
             if context.detailed_log_path:
                 log_destination_message = f"Console: {context.log_mode} | Log detalhado temporario: {context.detailed_log_path}"
-                print(log_destination_message)
+                if context.log_mode != "quiet":
+                    print(log_destination_message)
                 write_detailed_log_line(context, f"[{time.strftime('%H:%M:%S')}] [RUN] {log_destination_message}")
             else:
                 log_destination_message = f"Console: {context.log_mode} | Log detalhado temporario: off"
-                print(log_destination_message)
+                if context.log_mode != "quiet":
+                    print(log_destination_message)
                 write_detailed_log_line(context, f"[{time.strftime('%H:%M:%S')}] [RUN] {log_destination_message}")
 
             downloaders = [
@@ -6135,10 +6183,11 @@ async def forward_messages_from_channel(choices, channel_source, destination, ch
             context.analytics_report = analytics_report
             save_analytics_report(analytics_report)
             emit_executive_summary(context, analytics_report)
-            await log_context(
-                context,
-                f"[METRICS] analytics persistido em {analytics_report['run']['report_path']}",
-            )
+            if ANALYTICS_TO_FILE and analytics_report.get("run", {}).get("report_path"):
+                await log_context(
+                    context,
+                    f"[METRICS] analytics persistido em {analytics_report['run']['report_path']}",
+                )
 
             for _ in range(DOWNLOAD_WORKERS):
                 await context.download_queue.put(((float("inf"), float("inf"), float("inf")), float("inf"), None))
@@ -6195,33 +6244,64 @@ def cleanup_asyncio_warnings():
     except Exception:
         pass
 
+def cleanup_job_state():
+    global run_download_path, task_lock_path
+    if run_download_path:
+        cleanup_run_download_dir(run_download_path)
+        run_download_path = None
+    if task_lock_path:
+        release_runtime_lock(task_lock_path)
+        task_lock_path = None
+
 def cleanup_runtime_state():
-    cleanup_run_download_dir(run_download_path)
-    release_runtime_lock(task_lock_path)
+    cleanup_job_state()
     release_runtime_lock(runtime_lock_path)
+
+BATCH_COOLDOWN_SECONDS = 60
 
 if __name__ == "__main__":
     warnings.filterwarnings("ignore", message="coroutine 'Client.handle_updates' was never awaited")
+    runtime_lock_path = None
+    task_lock_path = None
+    run_download_path = None
     try:
         show_banner()
         session_name, runtime_lock_path = acquire_available_session(lock_prefix="session_forward")
         authenticate(session_name)
         cache_path()
-        run_id = build_run_id("forward")
-        run_download_path = create_run_download_dir(run_id)
-        download_path = run_download_path
-        channel_source, destination, chat_title = get_channels()
-        task_lock_path = acquire_runtime_lock(
-            build_lock_name(
-                "task_forward",
-                channel_source,
-                destination["chat_id"],
-                destination.get("thread_id") or "chat",
-                chat_title,
-            )
-        )
+        job_count = get_batch_job_count()
+        jobs = collect_batch_jobs(job_count)
         choices = get_user_choices()
-        asyncio.run(forward_messages_from_channel(choices, channel_source, destination, chat_title))
+        for index, job in enumerate(jobs):
+            print(f"\n>>> Iniciando clonagem {index + 1} de {job_count}: {job['chat_title']}")
+            run_id = build_run_id("forward")
+            run_download_path = create_run_download_dir(run_id)
+            download_path = run_download_path
+            task_lock_path = acquire_runtime_lock(
+                build_lock_name(
+                    "task_forward",
+                    job["channel_source"],
+                    job["destination"]["chat_id"],
+                    job["destination"].get("thread_id") or "chat",
+                    job["chat_title"],
+                )
+            )
+            try:
+                asyncio.run(
+                    forward_messages_from_channel(
+                        choices,
+                        job["channel_source"],
+                        job["destination"],
+                        job["chat_title"],
+                        custom_caption=job["custom_caption"],
+                    )
+                )
+            finally:
+                cleanup_job_state()
+
+            if index < len(jobs) - 1:
+                print(f"Aguardando {BATCH_COOLDOWN_SECONDS}s antes da próxima clonagem...")
+                time.sleep(BATCH_COOLDOWN_SECONDS)
     finally:
         cleanup_runtime_state()
         cleanup_asyncio_warnings()
