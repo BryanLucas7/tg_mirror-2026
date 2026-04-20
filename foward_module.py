@@ -1471,6 +1471,7 @@ def is_retryable_failure_error(error_text):
         "winerror 1231",
         "windows ainda estava usando o arquivo",
         "winerror 32",
+        "already waiting for incoming data",
     )
     return any(token in normalized for token in retryable_tokens)
 
@@ -2018,7 +2019,7 @@ def should_emit_console_message(context, message, category):
         return True
 
     lowered = message.lower()
-    if "falhou" in lowered or "interrompendo job" in lowered:
+    if "falhou" in lowered or "interrompendo job" in lowered or "saltando item" in lowered:
         return True
 
     if context.log_mode == "quiet":
@@ -2724,6 +2725,7 @@ def is_transport_error(error):
         or "NETWORK ISSUES" in error_text
         or "TIMED OUT" in error_text
         or "CONNECTION RESET" in error_text
+        or "ALREADY WAITING FOR INCOMING DATA" in error_text
     )
 
 def format_metrics_summary(context):
@@ -5062,8 +5064,6 @@ async def preupload_item(source_client, preupload_client, destination_peer, cont
                 if not is_transient:
                     raise
                 transient_attempt += 1
-                if transient_attempt >= max_transient_attempts:
-                    raise
                 backoff = min(
                     PREUPLOAD_TRANSIENT_BACKOFF_MAX_SECONDS,
                     PREUPLOAD_TRANSIENT_BACKOFF_BASE_SECONDS * transient_attempt,
@@ -5794,8 +5794,6 @@ async def log_item_completion(context, item, success):
     )
 
 async def retry_failed_item_before_abort(context, item):
-    if item.failure_retry_attempts >= FAILED_ITEM_RETRY_MAX_ATTEMPTS:
-        return False
     if not is_retryable_failure_error(item.error):
         return False
 
@@ -5812,14 +5810,14 @@ async def retry_failed_item_before_abort(context, item):
         "item_retry_before_abort",
         item=item,
         attempt=attempt,
-        max_attempts=FAILED_ITEM_RETRY_MAX_ATTEMPTS,
+        max_attempts=0,
         wait_seconds=float(wait_seconds),
         error=last_error,
     )
     await log_context(
         context,
         f"[PUB] {item.label}: falha transitoria detectada ({last_error}) | "
-        f"retry global {attempt}/{FAILED_ITEM_RETRY_MAX_ATTEMPTS} em {wait_seconds}s antes de abortar.",
+        f"retry global #{attempt} em {wait_seconds}s",
     )
 
     await asyncio.sleep(wait_seconds)
@@ -5855,10 +5853,13 @@ async def publisher_loop(client, context):
             await log_item_completion(context, item, False)
             await log_context(
                 context,
-                f"[PUB] interrompendo job no item seq {item.seq} para preservar a ordem. "
-                f"Resolva o problema e reexecute para retomar a partir desse ponto.",
+                f"[PUB] {item.label}: falha permanente (nao retryavel), saltando item para continuar o pipeline.",
             )
-            return
+            save_progress(context.progress_file, item.last_message_id)
+            context.next_seq_to_publish += 1
+            await schedule_more_items(context)
+            await notify_pipeline_slots(context)
+            continue
 
         try:
             await send_item(client, context, item)
@@ -5872,10 +5873,13 @@ async def publisher_loop(client, context):
             await log_item_completion(context, item, False)
             await log_context(
                 context,
-                f"[PUB] interrompendo job no item seq {item.seq} para preservar a ordem. "
-                f"Resolva o problema e reexecute para retomar a partir desse ponto.",
+                f"[PUB] {item.label}: falha permanente no envio (nao retryavel), saltando item para continuar o pipeline.",
             )
-            return
+            save_progress(context.progress_file, item.last_message_id)
+            context.next_seq_to_publish += 1
+            await schedule_more_items(context)
+            await notify_pipeline_slots(context)
+            continue
         finally:
             item.aux_paths = []
             item.local_paths = []
