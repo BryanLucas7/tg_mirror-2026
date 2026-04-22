@@ -5812,8 +5812,6 @@ async def log_item_completion(context, item, success):
 STREAM_RELAY_FALLBACK_THRESHOLD = 3
 
 async def retry_failed_item_before_abort(context, item):
-    if item.failure_retry_attempts >= FAILED_ITEM_RETRY_MAX_ATTEMPTS:
-        return False
     if not is_retryable_failure_error(item.error):
         return False
 
@@ -5861,7 +5859,7 @@ async def retry_failed_item_before_abort(context, item):
     await log_context(
         context,
         f"[PUB] {item.label}: falha transitoria detectada ({last_error}) | "
-        f"retry global #{attempt}/{FAILED_ITEM_RETRY_MAX_ATTEMPTS} em {wait_seconds}s",
+        f"retry global #{attempt} em {wait_seconds}s",
     )
 
     await asyncio.sleep(wait_seconds)
@@ -5893,14 +5891,26 @@ async def publisher_loop(client, context):
         if item.state == "failed":
             if await retry_failed_item_before_abort(context, item):
                 continue
-            context.failure_count += 1
-            await log_item_completion(context, item, False)
+            # Erro nao reconhecido como transitorio: tenta mesmo assim com backoff longo.
+            item.failure_retry_attempts += 1
+            wait_seconds = min(600, 60 * item.failure_retry_attempts)
             await log_context(
                 context,
-                f"[PUB] {item.label}: falha permanente (nao retryavel), saltando item para continuar o pipeline.",
+                f"[PUB] {item.label}: erro persistente ({item.error}) | "
+                f"retry forcado #{item.failure_retry_attempts} em {wait_seconds}s (nenhum item sera pulado).",
             )
-            save_progress(context.progress_file, item.last_message_id)
-            context.next_seq_to_publish += 1
+            await asyncio.sleep(wait_seconds)
+            reset_item_for_retry(item)
+            ensure_item_analytics_state(context, item)["source_mode_final"] = ""
+            if item.stream_relay:
+                await enqueue_preupload_item(context, item)
+            elif item.needs_download:
+                await enqueue_download_item(context, item)
+            else:
+                item.state = "ready"
+                async with context.ready_condition:
+                    context.ready_items[item.seq] = item
+                    context.ready_condition.notify_all()
             await schedule_more_items(context)
             await notify_pipeline_slots(context)
             continue
@@ -5913,14 +5923,25 @@ async def publisher_loop(client, context):
             item.send_finished_at = time.time()
             if await retry_failed_item_before_abort(context, item):
                 continue
-            context.failure_count += 1
-            await log_item_completion(context, item, False)
+            item.failure_retry_attempts += 1
+            wait_seconds = min(600, 60 * item.failure_retry_attempts)
             await log_context(
                 context,
-                f"[PUB] {item.label}: falha permanente no envio (nao retryavel), saltando item para continuar o pipeline.",
+                f"[PUB] {item.label}: erro persistente no envio ({item.error}) | "
+                f"retry forcado #{item.failure_retry_attempts} em {wait_seconds}s (nenhum item sera pulado).",
             )
-            save_progress(context.progress_file, item.last_message_id)
-            context.next_seq_to_publish += 1
+            await asyncio.sleep(wait_seconds)
+            reset_item_for_retry(item)
+            ensure_item_analytics_state(context, item)["source_mode_final"] = ""
+            if item.stream_relay:
+                await enqueue_preupload_item(context, item)
+            elif item.needs_download:
+                await enqueue_download_item(context, item)
+            else:
+                item.state = "ready"
+                async with context.ready_condition:
+                    context.ready_items[item.seq] = item
+                    context.ready_condition.notify_all()
             await schedule_more_items(context)
             await notify_pipeline_slots(context)
             continue
