@@ -1478,6 +1478,13 @@ def is_retryable_failure_error(error_text):
     )
     return any(token in normalized for token in retryable_tokens)
 
+def is_stream_relay_reference_error(error_text):
+    normalized = (error_text or "").strip().lower()
+    return (
+        "expirou o acesso temporario" in normalized
+        or "parte do arquivo invalida" in normalized
+    )
+
 def is_source_retryable_error(error):
     if isinstance(error, FloodWait):
         return True
@@ -5802,6 +5809,8 @@ async def log_item_completion(context, item, success):
         f"up: {format_phase_duration(item.send_started_at, item.send_finished_at)}{timing_tail} | {item.label}{extra}",
     )
 
+STREAM_RELAY_FALLBACK_THRESHOLD = 3
+
 async def retry_failed_item_before_abort(context, item):
     if item.failure_retry_attempts >= FAILED_ITEM_RETRY_MAX_ATTEMPTS:
         return False
@@ -5809,26 +5818,50 @@ async def retry_failed_item_before_abort(context, item):
         return False
 
     item.failure_retry_attempts += 1
-    wait_seconds = min(
-        FAILED_ITEM_RETRY_BACKOFF_MAX_SECONDS,
-        FAILED_ITEM_RETRY_BACKOFF_BASE_SECONDS * item.failure_retry_attempts,
-    )
     attempt = item.failure_retry_attempts
     last_error = item.error
+
+    # Após STREAM_RELAY_FALLBACK_THRESHOLD falhas de referência no stream relay,
+    # muda para download em disco: elimina a dependência de file reference do Telegram.
+    if (
+        item.stream_relay
+        and attempt >= STREAM_RELAY_FALLBACK_THRESHOLD
+        and is_stream_relay_reference_error(last_error)
+    ):
+        await log_context(
+            context,
+            f"[PUB] {item.label}: stream relay falhou {attempt}x com erro de referencia, "
+            f"alternando para download em disco como fallback mais seguro.",
+        )
+        item.stream_relay = False
+        item.failure_retry_attempts = 0
+        record_analytics_event(context, "stream_relay_fallback_to_download", item=item, attempt=attempt, error=last_error)
+        await asyncio.sleep(FAILED_ITEM_RETRY_BACKOFF_BASE_SECONDS)
+        reset_item_for_retry(item)
+        ensure_item_analytics_state(context, item)["source_mode_final"] = ""
+        await enqueue_download_item(context, item)
+        await schedule_more_items(context)
+        await notify_pipeline_slots(context)
+        return True
+
+    wait_seconds = min(
+        FAILED_ITEM_RETRY_BACKOFF_MAX_SECONDS,
+        FAILED_ITEM_RETRY_BACKOFF_BASE_SECONDS * attempt,
+    )
 
     record_analytics_event(
         context,
         "item_retry_before_abort",
         item=item,
         attempt=attempt,
-        max_attempts=0,
+        max_attempts=FAILED_ITEM_RETRY_MAX_ATTEMPTS,
         wait_seconds=float(wait_seconds),
         error=last_error,
     )
     await log_context(
         context,
         f"[PUB] {item.label}: falha transitoria detectada ({last_error}) | "
-        f"retry global #{attempt} em {wait_seconds}s",
+        f"retry global #{attempt}/{FAILED_ITEM_RETRY_MAX_ATTEMPTS} em {wait_seconds}s",
     )
 
     await asyncio.sleep(wait_seconds)
