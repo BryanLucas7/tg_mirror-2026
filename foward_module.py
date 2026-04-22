@@ -101,10 +101,10 @@ DISK_HEADROOM_BYTES = 768 * 1024 * 1024
 SIZE_AWARE_HORIZON = 4
 ETA_HISTORY_SIZE = 6
 STATUS_LOG_INTERVAL_SECONDS = 15
-PREUPLOAD_TRANSIENT_MAX_ATTEMPTS = 8
+PREUPLOAD_TRANSIENT_MAX_ATTEMPTS = 20
 PREUPLOAD_TRANSIENT_BACKOFF_BASE_SECONDS = 8
 PREUPLOAD_TRANSIENT_BACKOFF_MAX_SECONDS = 120
-FAILED_ITEM_RETRY_MAX_ATTEMPTS = 3
+FAILED_ITEM_RETRY_MAX_ATTEMPTS = 10
 FAILED_ITEM_RETRY_BACKOFF_BASE_SECONDS = 20
 FAILED_ITEM_RETRY_BACKOFF_MAX_SECONDS = 180
 HEAD_PRESSURE_BACKGROUND_PREUPLOAD_LIMIT = 1
@@ -1442,6 +1442,8 @@ def simplify_error(error):
     upper = text.upper()
     if "FILE_REFERENCE_EXPIRED" in upper:
         return "o Telegram expirou o acesso temporario a esta midia."
+    if "FILE_PART_INVALID" in upper or "FILE_PART_LENGTH" in upper:
+        return "parte do arquivo invalida durante upload, sera retentada."
     if "PEER ID INVALID" in upper:
         return "o canal de destino nao foi reconhecido pela sessao."
     if "FLOOD" in upper:
@@ -1463,6 +1465,7 @@ def is_retryable_failure_error(error_text):
         "temporario",
         "flood",
         "expirou o acesso temporario",
+        "parte do arquivo invalida",
         "getfile",
         "unable to connect",
         "network",
@@ -1483,6 +1486,8 @@ def is_source_retryable_error(error):
         "FLOOD" in error_text
         or "GETFILE" in error_text
         or "FILE_REFERENCE_EXPIRED" in error_text
+        or "FILE_PART_INVALID" in error_text
+        or "FILE_PART_LENGTH" in error_text
         or is_transport_error(error)
     )
 
@@ -4805,7 +4810,7 @@ async def relay_upload_media_reference(source_client, upload_client, peer, conte
 
     raise RuntimeError("Tipo de mídia não suportado para relay em streaming.")
 
-async def relay_upload_media_reference_with_retry(source_client, upload_client, peer, context, item, message, attempts=2):
+async def relay_upload_media_reference_with_retry(source_client, upload_client, peer, context, item, message, attempts=5):
     current_message = message
     for attempt in range(attempts):
         try:
@@ -5059,11 +5064,15 @@ async def preupload_item(source_client, preupload_client, destination_peer, cont
                     "FLOOD" in error_text
                     or "GETFILE" in error_text
                     or "FILE_REFERENCE_EXPIRED" in error_text
+                    or "FILE_PART_INVALID" in error_text
+                    or "FILE_PART_LENGTH" in error_text
                     or is_transport_error(error)
                 )
                 if not is_transient:
                     raise
                 transient_attempt += 1
+                if transient_attempt >= PREUPLOAD_TRANSIENT_MAX_ATTEMPTS:
+                    raise
                 backoff = min(
                     PREUPLOAD_TRANSIENT_BACKOFF_MAX_SECONDS,
                     PREUPLOAD_TRANSIENT_BACKOFF_BASE_SECONDS * transient_attempt,
@@ -5794,6 +5803,8 @@ async def log_item_completion(context, item, success):
     )
 
 async def retry_failed_item_before_abort(context, item):
+    if item.failure_retry_attempts >= FAILED_ITEM_RETRY_MAX_ATTEMPTS:
+        return False
     if not is_retryable_failure_error(item.error):
         return False
 
