@@ -5081,6 +5081,11 @@ async def preupload_item(source_client, preupload_client, destination_peer, cont
                 error_text = str(error).upper()
                 if isinstance(error, MessageDeletedError):
                     raise
+                # FILE_REFERENCE_EXPIRED durante stream relay: relay_upload_media_reference_with_retry
+                # ja tentou 5x com refresh de referencia e nao resolveu — fail rapido para acionar
+                # o fallback para download em disco no publisher, sem desperdicar mais 20 transient retries.
+                if "FILE_REFERENCE_EXPIRED" in error_text and item.stream_relay:
+                    raise
                 is_transient = (
                     "FLOOD" in error_text
                     or "GETFILE" in error_text
@@ -5823,7 +5828,7 @@ async def log_item_completion(context, item, success):
         f"up: {format_phase_duration(item.send_started_at, item.send_finished_at)}{timing_tail} | {item.label}{extra}",
     )
 
-STREAM_RELAY_FALLBACK_THRESHOLD = 3
+STREAM_RELAY_FALLBACK_THRESHOLD = 1
 
 async def retry_failed_item_before_abort(context, item):
     if not is_retryable_failure_error(item.error):
