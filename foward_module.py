@@ -4830,7 +4830,16 @@ async def relay_upload_media_reference(source_client, upload_client, peer, conte
     raise RuntimeError("Tipo de mídia não suportado para relay em streaming.")
 
 async def relay_upload_media_reference_with_retry(source_client, upload_client, peer, context, item, message, attempts=5):
-    current_message = message
+    # Messages são buscadas em lote no início da clonagem e podem ter file_references expiradas
+    # quando chegam ao preupload após horas na fila. Sempre começa com uma referência fresca
+    # para eliminar FILE_REFERENCE_EXPIRED logo na primeira tentativa.
+    try:
+        current_message = await refresh_message(source_client, message)
+    except MessageDeletedError:
+        raise
+    except Exception:
+        current_message = message  # se refresh falhar por problema de rede, continua com o original; retry cuida do resto
+
     for attempt in range(attempts):
         try:
             remote_media = await relay_upload_media_reference(source_client, upload_client, peer, context, item, current_message)
@@ -5171,7 +5180,15 @@ async def preupload_item(source_client, preupload_client, destination_peer, cont
             await context.disk_budget.release(item)
 
 async def download_media_with_retry(client, context, item, message, file_name, attempts=2):
-    current_message = message
+    # Mesmo problema do stream relay: messages buscadas em lote no início podem ter referências
+    # expiradas horas depois. Pre-refresh garante que o download nunca falha na primeira tentativa.
+    try:
+        current_message = await refresh_message(client, message)
+    except MessageDeletedError:
+        raise
+    except Exception:
+        current_message = message
+
     for attempt in range(attempts):
         budget_bucket = None
         dc_id = None
