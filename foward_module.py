@@ -47,6 +47,9 @@ from pyrogram.session import Auth, Session
 from pyrogram.crypto import aes
 import pyrogram
 
+class MessageDeletedError(Exception):
+    """Raised when get_messages() confirms the source message no longer exists."""
+
 """ Global """
 session_name = "user"
 download_path = "downloads"
@@ -1438,6 +1441,8 @@ def print_stage(processed, total, message_id, text):
     print(f"[{processed}/{total}] Mensagem {message_id}: {text}")
 
 def simplify_error(error):
+    if isinstance(error, MessageDeletedError):
+        return "mensagem deletada da origem confirmado por get_messages."
     text = str(error)
     upper = text.upper()
     if "FILE_REFERENCE_EXPIRED" in upper:
@@ -1477,6 +1482,9 @@ def is_retryable_failure_error(error_text):
         "already waiting for incoming data",
     )
     return any(token in normalized for token in retryable_tokens)
+
+def is_confirmed_deleted_error(error_text):
+    return "mensagem deletada da origem confirmado" in (error_text or "").lower()
 
 def is_stream_relay_reference_error(error_text):
     normalized = (error_text or "").strip().lower()
@@ -2611,6 +2619,10 @@ async def close_client_quietly(client):
 
 async def refresh_message(client, message):
     refreshed = await call_telegram(client.get_messages, message.chat.id, message.id)
+    if refreshed and getattr(refreshed, "empty", False):
+        raise MessageDeletedError(
+            f"Mensagem {message.id} foi deletada da origem (get_messages retornou empty=True)."
+        )
     return refreshed or message
 
 def get_message_media(message):
@@ -5067,6 +5079,8 @@ async def preupload_item(source_client, preupload_client, destination_peer, cont
                 await asyncio.sleep(wait_seconds)
             except Exception as error:
                 error_text = str(error).upper()
+                if isinstance(error, MessageDeletedError):
+                    raise
                 is_transient = (
                     "FLOOD" in error_text
                     or "GETFILE" in error_text
@@ -5881,6 +5895,21 @@ async def retry_failed_item_before_abort(context, item):
     await notify_pipeline_slots(context)
     return True
 
+async def _reenqueue_item(context, item):
+    reset_item_for_retry(item)
+    ensure_item_analytics_state(context, item)["source_mode_final"] = ""
+    if item.stream_relay:
+        await enqueue_preupload_item(context, item)
+    elif item.needs_download:
+        await enqueue_download_item(context, item)
+    else:
+        item.state = "ready"
+        async with context.ready_condition:
+            context.ready_items[item.seq] = item
+            context.ready_condition.notify_all()
+    await schedule_more_items(context)
+    await notify_pipeline_slots(context)
+
 async def publisher_loop(client, context):
     while context.next_seq_to_publish <= context.total_items:
         async with context.ready_condition:
@@ -5891,7 +5920,20 @@ async def publisher_loop(client, context):
         if item.state == "failed":
             if await retry_failed_item_before_abort(context, item):
                 continue
-            # Erro nao reconhecido como transitorio: tenta mesmo assim com backoff longo.
+            # Unico motivo valido para pular: confirmacao de que a mensagem foi deletada da origem.
+            if is_confirmed_deleted_error(item.error):
+                context.failure_count += 1
+                await log_item_completion(context, item, False)
+                await log_context(
+                    context,
+                    f"[PUB] {item.label}: pulado — mensagem confirmada como deletada da origem.",
+                )
+                save_progress(context.progress_file, item.last_message_id)
+                context.next_seq_to_publish += 1
+                await schedule_more_items(context)
+                await notify_pipeline_slots(context)
+                continue
+            # Erro nao reconhecido: retenta com backoff longo ate conseguir.
             item.failure_retry_attempts += 1
             wait_seconds = min(600, 60 * item.failure_retry_attempts)
             await log_context(
@@ -5900,19 +5942,7 @@ async def publisher_loop(client, context):
                 f"retry forcado #{item.failure_retry_attempts} em {wait_seconds}s (nenhum item sera pulado).",
             )
             await asyncio.sleep(wait_seconds)
-            reset_item_for_retry(item)
-            ensure_item_analytics_state(context, item)["source_mode_final"] = ""
-            if item.stream_relay:
-                await enqueue_preupload_item(context, item)
-            elif item.needs_download:
-                await enqueue_download_item(context, item)
-            else:
-                item.state = "ready"
-                async with context.ready_condition:
-                    context.ready_items[item.seq] = item
-                    context.ready_condition.notify_all()
-            await schedule_more_items(context)
-            await notify_pipeline_slots(context)
+            await _reenqueue_item(context, item)
             continue
 
         try:
@@ -5923,6 +5953,18 @@ async def publisher_loop(client, context):
             item.send_finished_at = time.time()
             if await retry_failed_item_before_abort(context, item):
                 continue
+            if is_confirmed_deleted_error(item.error):
+                context.failure_count += 1
+                await log_item_completion(context, item, False)
+                await log_context(
+                    context,
+                    f"[PUB] {item.label}: pulado — mensagem confirmada como deletada da origem.",
+                )
+                save_progress(context.progress_file, item.last_message_id)
+                context.next_seq_to_publish += 1
+                await schedule_more_items(context)
+                await notify_pipeline_slots(context)
+                continue
             item.failure_retry_attempts += 1
             wait_seconds = min(600, 60 * item.failure_retry_attempts)
             await log_context(
@@ -5931,19 +5973,7 @@ async def publisher_loop(client, context):
                 f"retry forcado #{item.failure_retry_attempts} em {wait_seconds}s (nenhum item sera pulado).",
             )
             await asyncio.sleep(wait_seconds)
-            reset_item_for_retry(item)
-            ensure_item_analytics_state(context, item)["source_mode_final"] = ""
-            if item.stream_relay:
-                await enqueue_preupload_item(context, item)
-            elif item.needs_download:
-                await enqueue_download_item(context, item)
-            else:
-                item.state = "ready"
-                async with context.ready_condition:
-                    context.ready_items[item.seq] = item
-                    context.ready_condition.notify_all()
-            await schedule_more_items(context)
-            await notify_pipeline_slots(context)
+            await _reenqueue_item(context, item)
             continue
         finally:
             item.aux_paths = []
