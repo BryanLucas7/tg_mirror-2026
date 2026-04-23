@@ -86,8 +86,8 @@ STREAM_RELAY_INCLUDE_SOURCE_THUMB = False  # deixa o servidor gerar preview quan
 STREAM_RELAY_MAX_ACTIVE = max(1, min(PREUPLOAD_WORKERS, 4))
 STREAM_RELAY_LARGE_BYTES = 300 * 1024 * 1024
 STREAM_RELAY_HUGE_BYTES = 800 * 1024 * 1024
-STREAM_RELAY_MAX_LARGE_ACTIVE = 2
-STREAM_RELAY_MAX_LARGE_ACTIVE_BURST = 3  # preset do run 667: libera um terceiro grande quando houver fila real esperando slot
+STREAM_RELAY_MAX_LARGE_ACTIVE = 3
+STREAM_RELAY_MAX_LARGE_ACTIVE_BURST = 4  # libera um quarto grande quando houver fila real esperando slot
 STREAM_RELAY_MAX_HUGE_ACTIVE = 1
 SOURCE_READ_ENABLE_CDN = True
 SOURCE_READ_LARGE_BYTES = 300 * 1024 * 1024
@@ -169,7 +169,7 @@ TG_QUEUE_CAP_SMALL_DEFAULT = 5
 FLOOD_PRESSURE_WINDOW_SECONDS = 90.0
 FLOOD_PRESSURE_TIER_LOW_SECONDS = 5.0
 FLOOD_PRESSURE_TIER_HIGH_SECONDS = 20.0
-FLOOD_HYSTERESIS_CLEAN_SECONDS = 90.0
+FLOOD_HYSTERESIS_CLEAN_SECONDS = 30.0
 
 # Tabela de knobs por tier. Tier 0 = cap do config; tiers > 0 reduzem progressivamente.
 # Local cap (SMALL/LARGE/BURST/SESSION_BUDGET) é o piso máximo; invariante tg_large
