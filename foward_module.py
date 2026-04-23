@@ -42,6 +42,10 @@ from pyrogram import Client
 from pyrogram import raw
 from pyrogram.types import InputMediaAudio, InputMediaDocument, InputMediaPhoto, InputMediaVideo
 from pyrogram.errors import CDNFileHashMismatch, FloodWait, TakeoutInitDelay, VolumeLocNotFound
+try:
+    from pyrogram.errors import FloodPremiumWait as _FloodPremiumWait
+except ImportError:
+    _FloodPremiumWait = type(None)  # nunca vai dar match, sem risco
 from pyrogram.file_id import FileId, FileType
 from pyrogram.session import Auth, Session
 from pyrogram.crypto import aes
@@ -1449,6 +1453,8 @@ def simplify_error(error):
         return "o Telegram expirou o acesso temporario a esta midia."
     if "FILE_PART_INVALID" in upper or "FILE_PART_LENGTH" in upper:
         return "parte do arquivo invalida durante upload, sera retentada."
+    if "FILE_PART_X_MISSING" in upper or "FILE_PART_MISSING" in upper:
+        return "partes do arquivo faltando no servidor, upload sera reiniciado do zero."
     if "PEER ID INVALID" in upper:
         return "o canal de destino nao foi reconhecido pela sessao."
     if "FLOOD" in upper:
@@ -1471,6 +1477,7 @@ def is_retryable_failure_error(error_text):
         "flood",
         "expirou o acesso temporario",
         "parte do arquivo invalida",
+        "partes do arquivo faltando",
         "getfile",
         "unable to connect",
         "network",
@@ -1491,6 +1498,7 @@ def is_stream_relay_reference_error(error_text):
     return (
         "expirou o acesso temporario" in normalized
         or "parte do arquivo invalida" in normalized
+        or "partes do arquivo faltando" in normalized
     )
 
 def is_source_retryable_error(error):
@@ -2469,7 +2477,7 @@ async def call_telegram(operation, *args, _metrics_context=None, _trace_item=Non
     while True:
         try:
             return await operation(*args, **kwargs)
-        except FloodWait as error:
+        except (FloodWait, _FloodPremiumWait) as error:
             if _metrics_context is not None:
                 _metrics_context.metrics["flood_waits_by_method"][method_name] += 1
                 _metrics_context.metrics["flood_wait_seconds_by_method"][method_name] += error.value
@@ -4845,9 +4853,22 @@ async def relay_upload_media_reference_with_retry(source_client, upload_client, 
             remote_media = await relay_upload_media_reference(source_client, upload_client, peer, context, item, current_message)
             return remote_media, current_message
         except Exception as error:
-            if "FILE_REFERENCE_EXPIRED" in str(error).upper() and attempt < attempts - 1:
+            error_upper = str(error).upper()
+            if attempt >= attempts - 1:
+                raise
+            if "FILE_REFERENCE_EXPIRED" in error_upper:
+                # Limpa o resume state antes de retry: partes uploadadas com a referencia antiga
+                # podem estar em estado incerto no storage do Telegram, causando FILE_PART_X_MISSING.
+                # Comecar do zero com novo file_id e novo source stream eh mais seguro.
+                item.upload_resume_states.clear()
                 current_message = await refresh_message(source_client, current_message)
                 await asyncio.sleep(1)
+                continue
+            if "FILE_PART_X_MISSING" in error_upper or "FILE_PART_MISSING" in error_upper:
+                # Resume state corrompido: partes "acked" nao estao mais no storage do Telegram.
+                # Limpa e reinicia o upload do zero.
+                item.upload_resume_states.clear()
+                await asyncio.sleep(2)
                 continue
             raise
 
@@ -5062,8 +5083,8 @@ async def preupload_item(source_client, preupload_client, destination_peer, cont
                 else:
                     await prepare_single_item_for_publish(source_client, preupload_client, destination_peer, context, item)
                 break
-            except FloodWait as error:
-                wait_seconds = max(1, int(getattr(error, "value", 5)))
+            except (FloodWait, _FloodPremiumWait) as error:
+                wait_seconds = max(1, int(getattr(error, "value", getattr(error, "x", 12))))
                 state = ensure_item_analytics_state(context, item)
                 retry_phase = infer_retry_phase(item, error)
                 state["flood_wait_count"] += 1
@@ -5090,10 +5111,15 @@ async def preupload_item(source_client, preupload_client, destination_peer, cont
                 error_text = str(error).upper()
                 if isinstance(error, MessageDeletedError):
                     raise
-                # FILE_REFERENCE_EXPIRED durante stream relay: relay_upload_media_reference_with_retry
-                # ja tentou 5x com refresh de referencia e nao resolveu — fail rapido para acionar
-                # o fallback para download em disco no publisher, sem desperdicar mais 20 transient retries.
-                if "FILE_REFERENCE_EXPIRED" in error_text and item.stream_relay:
+                # FILE_REFERENCE_EXPIRED / FILE_PART_X_MISSING durante stream relay: ja foram tratados
+                # em relay_upload_media_reference_with_retry (5 tentativas com limpeza de resume state).
+                # Fail rapido aqui para acionar o fallback para download em disco no publisher.
+                if item.stream_relay and (
+                    "FILE_REFERENCE_EXPIRED" in error_text
+                    or "FILE_PART_X_MISSING" in error_text
+                    or "FILE_PART_MISSING" in error_text
+                ):
+                    item.upload_resume_states.clear()
                     raise
                 is_transient = (
                     "FLOOD" in error_text
