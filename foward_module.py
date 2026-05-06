@@ -54,6 +54,9 @@ import pyrogram
 class MessageDeletedError(Exception):
     """Raised when get_messages() confirms the source message no longer exists."""
 
+class UploadTooLargeForRelayError(RuntimeError):
+    """Raised when Telegram cannot accept this file through SaveBigFilePart."""
+
 """ Global """
 session_name = "user"
 download_path = "downloads"
@@ -82,6 +85,10 @@ ENFORCE_TELEGRAM_QUEUE_CAPS = False
 STREAM_RELAY_MIN_BYTES = 20 * 1024 * 1024
 STREAM_UPLOAD_SESSIONS = 5  # sessões de upload paralelas por stream (big files)
 STREAM_UPLOAD_QUEUE_DEPTH = 8  # profundidade local por sessão para amortecer backpressure
+TELEGRAM_UPLOAD_PART_SIZE = 512 * 1024
+TELEGRAM_UPLOAD_MAX_FILE_PARTS = 4000
+TELEGRAM_UPLOAD_MAX_FILE_PARTS_PREMIUM = 8000
+SOURCE_REFERENCE_REFRESH_MAX_ATTEMPTS = 8
 STREAM_RELAY_INCLUDE_SOURCE_THUMB = False  # deixa o servidor gerar preview quando possível
 STREAM_RELAY_MAX_ACTIVE = max(1, min(PREUPLOAD_WORKERS, 4))
 STREAM_RELAY_LARGE_BYTES = 300 * 1024 * 1024
@@ -320,6 +327,8 @@ class WorkItem:
     upload_resume_states: Dict[Tuple[int, str], UploadResumeState] = field(default_factory=dict)
     caption_text: str = ""
     stream_relay: bool = False
+    server_copy_fallback: bool = False
+    server_copy_reason: str = ""
     failure_retry_attempts: int = 0
     source_mode_initial: str = ""
     source_mode_final: str = ""
@@ -1447,10 +1456,14 @@ def print_stage(processed, total, message_id, text):
 def simplify_error(error):
     if isinstance(error, MessageDeletedError):
         return "mensagem deletada da origem confirmado por get_messages."
+    if isinstance(error, UploadTooLargeForRelayError):
+        return str(error)
     text = str(error)
     upper = text.upper()
     if "FILE_REFERENCE_EXPIRED" in upper:
         return "o Telegram expirou o acesso temporario a esta midia."
+    if "FILE_PARTS_INVALID" in upper:
+        return "arquivo maior que o limite de upload desta sessao."
     if "FILE_PART_INVALID" in upper or "FILE_PART_LENGTH" in upper:
         return "parte do arquivo invalida durante upload, sera retentada."
     if "FILE_PART_X_MISSING" in upper or "FILE_PART_MISSING" in upper:
@@ -1514,6 +1527,34 @@ def is_source_retryable_error(error):
         or is_transport_error(error)
     )
 
+def is_file_reference_expired_error(error):
+    return "FILE_REFERENCE_EXPIRED" in str(error).upper()
+
+def is_file_parts_invalid_error(error):
+    return "FILE_PARTS_INVALID" in str(error).upper()
+
+def get_upload_max_file_parts(upload_client):
+    me = getattr(upload_client, "me", None)
+    if bool(getattr(me, "is_premium", False)):
+        return TELEGRAM_UPLOAD_MAX_FILE_PARTS_PREMIUM
+    return TELEGRAM_UPLOAD_MAX_FILE_PARTS
+
+def build_relay_upload_part_plan(upload_client, file_size):
+    size = max(0, int(file_size or 0))
+    part_size = TELEGRAM_UPLOAD_PART_SIZE
+    file_total_parts = int(math.ceil(size / part_size)) or 1
+    max_parts = get_upload_max_file_parts(upload_client)
+    if file_total_parts > max_parts:
+        max_bytes = max_parts * part_size
+        raise UploadTooLargeForRelayError(
+            f"arquivo com {format_bytes(size)} excede o limite de upload desta sessao "
+            f"({format_bytes(max_bytes)}; partes {file_total_parts}/{max_parts})."
+        )
+    return part_size, file_total_parts
+
+def should_use_server_copy_fallback(error):
+    return isinstance(error, UploadTooLargeForRelayError) or is_file_parts_invalid_error(error)
+
 def reset_item_for_retry(item):
     item.state = "pending"
     item.error = ""
@@ -1532,6 +1573,8 @@ def reset_item_for_retry(item):
     item.acked_at = None
     item.remote_media = None
     item.remote_media_group = []
+    item.server_copy_fallback = False
+    item.server_copy_reason = ""
     item.local_paths = []
     item.aux_paths = []
     item.source_mode_final = ""
@@ -2632,6 +2675,29 @@ async def refresh_message(client, message):
             f"Mensagem {message.id} foi deletada da origem (get_messages retornou empty=True)."
         )
     return refreshed or message
+
+def replace_item_message_reference(item, old_message, refreshed_message):
+    if item is None or old_message is None or refreshed_message is None:
+        return
+    old_id = getattr(old_message, "id", None)
+    if old_id is None:
+        return
+    for index, candidate in enumerate(item.messages):
+        if getattr(candidate, "id", None) == old_id:
+            item.messages[index] = refreshed_message
+            return
+
+async def refresh_source_ref(source_client, context, item, source_ref, stage_name):
+    if isinstance(source_ref, str):
+        raise RuntimeError("file_reference expirou para uma referencia sem mensagem original para refresh.")
+    refreshed = await refresh_message(source_client, source_ref)
+    replace_item_message_reference(item, source_ref, refreshed)
+    if context is not None and item is not None:
+        await log_context(
+            context,
+            f"[SOURCE] {item.label}: file_reference expirou em {stage_name}; mensagem atualizada via get_messages",
+        )
+    return refreshed
 
 def get_message_media(message):
     return (
@@ -4056,6 +4122,8 @@ async def fetch_source_offset_chunk_with_retry(source_client, worker_state, loca
                 cdn_logged,
             )
         except Exception as error:
+            if is_file_reference_expired_error(error):
+                raise
             if not is_source_retryable_error(error):
                 raise
             attempt += 1
@@ -4088,9 +4156,22 @@ async def fetch_source_offset_chunk_with_retry(source_client, worker_state, loca
             )
             await asyncio.sleep(backoff)
 
-async def stream_source_media_from_legacy_offset(source_client, source_ref, start_chunk_index):
-    async for chunk in source_client.stream_media(source_ref, offset=start_chunk_index):
-        yield chunk
+async def stream_source_media_from_legacy_offset(source_client, source_ref, start_chunk_index, context=None, item=None, stage_name="main"):
+    current_ref = source_ref
+    current_offset = max(0, int(start_chunk_index or 0))
+    refresh_attempts = 0
+    while True:
+        try:
+            async for chunk in source_client.stream_media(current_ref, offset=current_offset):
+                yield chunk
+                current_offset += 1
+            return
+        except Exception as error:
+            if not is_file_reference_expired_error(error) or refresh_attempts >= SOURCE_REFERENCE_REFRESH_MAX_ATTEMPTS:
+                raise
+            refresh_attempts += 1
+            current_ref = await refresh_source_ref(source_client, context, item, current_ref, stage_name)
+            await asyncio.sleep(1)
 
 async def stream_source_media(source_client, context, item, source_ref, file_size, stage_name):
     mode, session_count = get_source_reader_mode(file_size, stage_name)
@@ -4167,7 +4248,14 @@ async def stream_source_media(source_client, context, item, source_ref, file_siz
         budget_bucket = await acquire_source_budget(context, item, dc_id, budget_slots_needed, file_size)
 
         if mode == "legacy":
-            async for chunk in source_client.stream_media(source_ref):
+            async for chunk in stream_source_media_from_legacy_offset(
+                source_client,
+                source_ref,
+                0,
+                context=context,
+                item=item,
+                stage_name=stage_name,
+            ):
                 yielded_any_chunk = True
                 yield chunk
             return
@@ -4224,7 +4312,17 @@ async def stream_source_media(source_client, context, item, source_ref, file_siz
                 f"[SOURCE] {item.label}: leitura {mode} recuou para legacy apos limitacao da origem | "
                 f"motivo {simplify_error(error)} | retomando do chunk {next_expected_chunk}",
             )
-            async for chunk in stream_source_media_from_legacy_offset(source_client, source_ref, next_expected_chunk):
+            fallback_ref = source_ref
+            if is_file_reference_expired_error(error):
+                fallback_ref = await refresh_source_ref(source_client, context, item, source_ref, stage_name)
+            async for chunk in stream_source_media_from_legacy_offset(
+                source_client,
+                fallback_ref,
+                next_expected_chunk,
+                context=context,
+                item=item,
+                stage_name=stage_name,
+            ):
                 yield chunk
             return
         raise
@@ -4242,8 +4340,7 @@ async def stream_source_media(source_client, context, item, source_ref, file_siz
 
 async def stream_relay_input_file_baseline(source_client, upload_client, context, item, source_ref, file_name, file_size, stage_name, stage_key=None):
     async with upload_client.save_file_semaphore:
-        part_size = 512 * 1024
-        file_total_parts = int(math.ceil((file_size or 0) / part_size)) or 1
+        part_size, file_total_parts = build_relay_upload_part_plan(upload_client, file_size)
         is_big = file_size > 10 * 1024 * 1024
         n_sessions = STREAM_UPLOAD_SESSIONS if is_big else 1
         relay_started_at = time.time()
@@ -4336,7 +4433,14 @@ async def stream_relay_input_file_baseline(source_client, upload_client, context
 
             file_part = 0
             pending = bytearray()
-            source_stream = source_client.stream_media(source_ref).__aiter__()
+            source_stream = stream_source_media_from_legacy_offset(
+                source_client,
+                source_ref,
+                0,
+                context=context,
+                item=item,
+                stage_name=stage_name,
+            ).__aiter__()
 
             while True:
                 source_read_started_at = time.time()
@@ -4444,8 +4548,7 @@ async def stream_relay_input_file_baseline(source_client, upload_client, context
         )
 
 async def stream_relay_input_file_instrumented(source_client, upload_client, context, item, source_ref, file_name, file_size, stage_name, stage_key=None):
-    part_size = 512 * 1024
-    file_total_parts = int(math.ceil(file_size / part_size)) if file_size else 1
+    part_size, file_total_parts = build_relay_upload_part_plan(upload_client, file_size)
     is_big = file_size > 10 * 1024 * 1024
 
     resume_state = None
@@ -4837,7 +4940,7 @@ async def relay_upload_media_reference(source_client, upload_client, peer, conte
 
     raise RuntimeError("Tipo de mídia não suportado para relay em streaming.")
 
-async def relay_upload_media_reference_with_retry(source_client, upload_client, peer, context, item, message, attempts=5):
+async def relay_upload_media_reference_with_retry(source_client, upload_client, peer, context, item, message, attempts=SOURCE_REFERENCE_REFRESH_MAX_ATTEMPTS):
     # Messages são buscadas em lote no início da clonagem e podem ter file_references expiradas
     # quando chegam ao preupload após horas na fila. Sempre começa com uma referência fresca
     # para eliminar FILE_REFERENCE_EXPIRED logo na primeira tentativa.
@@ -4993,6 +5096,18 @@ async def upload_media_reference(upload_client, peer, message, file_name, thumb_
 
     raise RuntimeError("Tipo de mídia não suportado para pre-upload.")
 
+async def enable_server_copy_fallback(context, item, error):
+    item.server_copy_fallback = True
+    item.server_copy_reason = simplify_error(error)
+    item.remote_media = None
+    item.remote_media_group = []
+    item.state = "ready"
+    await log_context(
+        context,
+        f"[PRE] {item.label}: reupload impossivel ({item.server_copy_reason}); "
+        "usando copia server-side no envio.",
+    )
+
 async def prepare_single_item_for_publish(source_client, preupload_client, destination_peer, context, item):
     message = item.first_message
     final_caption = get_caption(message, context.custom_caption)
@@ -5008,14 +5123,20 @@ async def prepare_single_item_for_publish(source_client, preupload_client, desti
         prime_item_source_plan(context, item, message, item.estimated_bytes, stage_name="main")
         await acquire_stream_relay_slot(context, item)
         try:
-            item.remote_media, refreshed_message = await relay_upload_media_reference_with_retry(
-                source_client,
-                preupload_client,
-                destination_peer,
-                context,
-                item,
-                message,
-            )
+            try:
+                item.remote_media, refreshed_message = await relay_upload_media_reference_with_retry(
+                    source_client,
+                    preupload_client,
+                    destination_peer,
+                    context,
+                    item,
+                    message,
+                )
+            except Exception as error:
+                if should_use_server_copy_fallback(error):
+                    await enable_server_copy_fallback(context, item, error)
+                    return
+                raise
         finally:
             await release_stream_relay_slot(context, item)
         item.messages = [refreshed_message]
@@ -5027,7 +5148,13 @@ async def prepare_single_item_for_publish(source_client, preupload_client, desti
             if thumb_path:
                 item.aux_paths.append(thumb_path)
 
-        item.remote_media = await upload_media_reference(preupload_client, destination_peer, message, file_name, thumb_path)
+        try:
+            item.remote_media = await upload_media_reference(preupload_client, destination_peer, message, file_name, thumb_path)
+        except Exception as error:
+            if should_use_server_copy_fallback(error):
+                await enable_server_copy_fallback(context, item, error)
+                return
+            raise
     item.state = "ready"
 
 async def prepare_album_for_publish(source_client, preupload_client, destination_peer, context, item):
@@ -5042,14 +5169,20 @@ async def prepare_album_for_publish(source_client, preupload_client, destination
             prime_item_source_plan(context, item, message, get_media_size(message), stage_name="main")
             await acquire_stream_relay_slot(context, item)
             try:
-                remote_media, refreshed_message = await relay_upload_media_reference_with_retry(
-                    source_client,
-                    preupload_client,
-                    destination_peer,
-                    context,
-                    item,
-                    message,
-                )
+                try:
+                    remote_media, refreshed_message = await relay_upload_media_reference_with_retry(
+                        source_client,
+                        preupload_client,
+                        destination_peer,
+                        context,
+                        item,
+                        message,
+                    )
+                except Exception as error:
+                    if should_use_server_copy_fallback(error):
+                        await enable_server_copy_fallback(context, item, error)
+                        return
+                    raise
             finally:
                 await release_stream_relay_slot(context, item)
             refreshed_messages.append(refreshed_message)
@@ -5060,7 +5193,13 @@ async def prepare_album_for_publish(source_client, preupload_client, destination
                 thumb_path = await asyncio.to_thread(extract_thumbnail, file_name)
                 if thumb_path:
                     item.aux_paths.append(thumb_path)
-            remote_media = await upload_media_reference(preupload_client, destination_peer, message, file_name, thumb_path)
+            try:
+                remote_media = await upload_media_reference(preupload_client, destination_peer, message, file_name, thumb_path)
+            except Exception as error:
+                if should_use_server_copy_fallback(error):
+                    await enable_server_copy_fallback(context, item, error)
+                    return
+                raise
         item.remote_media_group.append(remote_media)
 
     if refreshed_messages:
@@ -5111,12 +5250,12 @@ async def preupload_item(source_client, preupload_client, destination_peer, cont
                 error_text = str(error).upper()
                 if isinstance(error, MessageDeletedError):
                     raise
-                # FILE_REFERENCE_EXPIRED / FILE_PART_X_MISSING durante stream relay: ja foram tratados
-                # em relay_upload_media_reference_with_retry (5 tentativas com limpeza de resume state).
-                # Fail rapido aqui para acionar o fallback para download em disco no publisher.
+                if item.stream_relay and "FILE_REFERENCE_EXPIRED" in error_text:
+                    item.upload_resume_states.clear()
+                # FILE_PART_X_MISSING durante stream relay indica estado de partes inconsistente.
+                # Reiniciar indefinidamente aqui costuma repetir o mesmo arquivo quebrado no servidor.
                 if item.stream_relay and (
-                    "FILE_REFERENCE_EXPIRED" in error_text
-                    or "FILE_PART_X_MISSING" in error_text
+                    "FILE_PART_X_MISSING" in error_text
                     or "FILE_PART_MISSING" in error_text
                 ):
                     item.upload_resume_states.clear()
@@ -5205,7 +5344,7 @@ async def preupload_item(source_client, preupload_client, destination_peer, cont
         if not item.stream_relay:
             await context.disk_budget.release(item)
 
-async def download_media_with_retry(client, context, item, message, file_name, attempts=2):
+async def download_media_with_retry(client, context, item, message, file_name, attempts=SOURCE_REFERENCE_REFRESH_MAX_ATTEMPTS):
     # Mesmo problema do stream relay: messages buscadas em lote no início podem ter referências
     # expiradas horas depois. Pre-refresh garante que o download nunca falha na primeira tentativa.
     try:
@@ -5468,15 +5607,61 @@ async def send_preuploaded_album(client, destination, item):
     send_result = await call_telegram(client.invoke, rpc)
     return extract_sent_message_ids(send_result)
 
-async def send_downloaded_message(client, item, destination, custom_caption):
+async def send_server_copy_single_message(client, context, item):
+    message = item.first_message
+    kwargs = {
+        "chat_id": context.destination["chat_id"],
+        "from_chat_id": context.channel_source,
+        "message_id": message.id,
+        "caption": item.caption_text or "",
+        "parse_mode": pyrogram.enums.ParseMode.DISABLED,
+        "reply_markup": get_reply_markup(message),
+        "message_thread_id": context.destination.get("thread_id"),
+    }
+    for attempt in range(SOURCE_REFERENCE_REFRESH_MAX_ATTEMPTS):
+        try:
+            sent_message = await safe_send_with_buttons(
+                client.copy_message,
+                fallback_func=client.copy_message,
+                **kwargs,
+            )
+            break
+        except Exception as error:
+            if not is_file_reference_expired_error(error) or attempt >= SOURCE_REFERENCE_REFRESH_MAX_ATTEMPTS - 1:
+                raise
+            await asyncio.sleep(1)
+    await send_overflow_text(client, context.destination, item.overflow_text)
+    return extract_sent_message_ids(sent_message)
+
+async def send_server_copy_album(client, context, item):
+    for attempt in range(SOURCE_REFERENCE_REFRESH_MAX_ATTEMPTS):
+        try:
+            sent_messages = await call_telegram(
+                client.copy_media_group,
+                chat_id=context.destination["chat_id"],
+                from_chat_id=context.channel_source,
+                message_id=item.first_message.id,
+                captions=item.caption_text or "",
+                message_thread_id=context.destination.get("thread_id"),
+            )
+            break
+        except Exception as error:
+            if not is_file_reference_expired_error(error) or attempt >= SOURCE_REFERENCE_REFRESH_MAX_ATTEMPTS - 1:
+                raise
+            await asyncio.sleep(1)
+    await send_overflow_text(client, context.destination, item.overflow_text)
+    return extract_sent_message_ids(sent_messages)
+
+async def send_downloaded_message(client, context, item):
+    destination = context.destination
     message = item.first_message
     reply_markup = get_reply_markup(message)
 
     if message.text:
         links_from_buttons = extract_links_from_buttons(message.reply_markup)
         text_with_links = (message.text + ' ' + links_from_buttons).strip()
-        if custom_caption:
-            text_with_links = f"{custom_caption} {text_with_links}".strip()
+        if context.custom_caption:
+            text_with_links = f"{context.custom_caption} {text_with_links}".strip()
         sent_message = await safe_send_with_buttons(
             client.send_message,
             fallback_func=client.send_message,
@@ -5486,6 +5671,9 @@ async def send_downloaded_message(client, item, destination, custom_caption):
             message_thread_id=destination.get("thread_id"),
         )
         return extract_sent_message_ids(sent_message)
+
+    if item.server_copy_fallback:
+        return await send_server_copy_single_message(client, context, item)
 
     sent_message_ids = await send_preuploaded_single_media(client, destination, item)
     await send_overflow_text(client, destination, item.overflow_text)
@@ -5668,11 +5856,13 @@ async def send_item(client, context, item):
         f"inicio_abs {format_absolute_timestamp(item.publish_started_at)}",
     )
 
-    if item.kind == "album":
+    if item.server_copy_fallback and item.kind == "album":
+        sent_message_ids = await send_server_copy_album(client, context, item)
+    elif item.kind == "album":
         sent_message_ids = await send_preuploaded_album(client, context.destination, item)
         await send_overflow_text(client, context.destination, item.overflow_text)
     else:
-        sent_message_ids = await send_downloaded_message(client, item, context.destination, context.custom_caption)
+        sent_message_ids = await send_downloaded_message(client, context, item)
 
     record_published_message_ids(context, item, sent_message_ids)
 
