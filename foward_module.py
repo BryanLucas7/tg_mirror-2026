@@ -99,6 +99,7 @@ STREAM_RELAY_MAX_HUGE_ACTIVE = 1
 SOURCE_READ_ENABLE_CDN = True
 SOURCE_READ_LARGE_BYTES = 300 * 1024 * 1024
 SOURCE_READ_CUSTOM_MIN_BYTES = 800 * 1024 * 1024
+SOURCE_READ_AVOID_PYROGRAM_GET_FILE = os.getenv("SOURCE_READ_AVOID_PYROGRAM_GET_FILE", "1").strip().lower() not in {"0", "false", "no", "off"}
 SOURCE_READ_PARALLEL_MIN_BYTES = 800 * 1024 * 1024
 SOURCE_READ_PARALLEL_SESSIONS = 1  # run 667 usava apenas 1 sessao por leitura custom/paralela
 SOURCE_READ_SESSION_BUDGET = 4  # orçamento por DC observado no run 667
@@ -4000,7 +4001,13 @@ def emit_executive_summary(context, report):
         write_detailed_log_line(context, f"[{time.strftime('%H:%M:%S')}] [SUMMARY] {line}")
 
 def get_source_reader_mode(file_size, stage_name):
-    if stage_name != "main" or not file_size or file_size < SOURCE_READ_CUSTOM_MIN_BYTES:
+    if not file_size:
+        return "legacy", 1
+    if SOURCE_READ_AVOID_PYROGRAM_GET_FILE:
+        if stage_name == "main" and file_size >= SOURCE_READ_PARALLEL_MIN_BYTES and SOURCE_READ_PARALLEL_SESSIONS > 1:
+            return "parallel", SOURCE_READ_PARALLEL_SESSIONS
+        return "custom", 1
+    if stage_name != "main" or file_size < SOURCE_READ_CUSTOM_MIN_BYTES:
         return "legacy", 1
     if file_size >= SOURCE_READ_PARALLEL_MIN_BYTES and SOURCE_READ_PARALLEL_SESSIONS > 1:
         return "parallel", SOURCE_READ_PARALLEL_SESSIONS
@@ -4443,6 +4450,18 @@ async def stream_source_media(source_client, context, item, source_ref, file_siz
             next_expected_chunk += 1
     except Exception as error:
         if mode != "legacy" and is_source_retryable_error(error):
+            if SOURCE_READ_AVOID_PYROGRAM_GET_FILE:
+                record_analytics_event(
+                    context,
+                    "source_custom_retryable_error",
+                    item=item,
+                    mode=mode,
+                    stage_name=stage_name,
+                    resume_chunk=next_expected_chunk,
+                    reason=simplify_error(error),
+                )
+                await cleanup_custom_source_pipeline(release_budget=False)
+                raise
             context.metrics["source_fallbacks"] += 1
             item_state = ensure_item_analytics_state(context, item)
             item_state["fallback_legacy"] = True
@@ -4593,6 +4612,8 @@ async def stream_relay_input_file_baseline(source_client, upload_client, context
             except Exception:
                 source_home_dc_id = None
             use_custom_source_reader = bool(getattr(item, "force_custom_source_reader", False))
+            if SOURCE_READ_AVOID_PYROGRAM_GET_FILE and file_size:
+                use_custom_source_reader = True
             if source_dc_id is not None and source_home_dc_id is not None and source_dc_id != source_home_dc_id:
                 use_custom_source_reader = True
             if use_custom_source_reader:
@@ -6772,6 +6793,12 @@ async def forward_messages_from_channel(choices, channel_source, destination, ch
 
             status_reporter = asyncio.create_task(pipeline_status_loop(context))
 
+            source_read_policy_label = (
+                "manual sem get_file"
+                if SOURCE_READ_AVOID_PYROGRAM_GET_FILE
+                else f"custom>={format_bytes(SOURCE_READ_CUSTOM_MIN_BYTES)}"
+            )
+
             if not SOURCE_BUDGET_ENABLED and SOURCE_READ_CUSTOM_MIN_BYTES >= (1 << 50):
                 startup_message = (
                     f"Iniciando reenvio de {context.total_items} item(ns) "
@@ -6788,7 +6815,7 @@ async def forward_messages_from_channel(choices, channel_source, destination, ch
                     f"Downloaders: {DOWNLOAD_WORKERS} | Limite disco local: {format_bytes(MAX_LOCAL_DISK_BYTES_PER_JOB)} | "
                     f"Reserva critica: {format_bytes(DISK_HEADROOM_BYTES)} | Pre-uploaders: {PREUPLOAD_WORKERS} | "
                     f"Streams ativos: {STREAM_RELAY_MAX_ACTIVE} | Sessoes por stream grande: {STREAM_UPLOAD_SESSIONS} | "
-                    f"Fila por sessao: {STREAM_UPLOAD_QUEUE_DEPTH} | Leitura origem: custom>={format_bytes(SOURCE_READ_CUSTOM_MIN_BYTES)} | "
+                    f"Fila por sessao: {STREAM_UPLOAD_QUEUE_DEPTH} | Leitura origem: {source_read_policy_label} | "
                     f"sleep<={SOURCE_READ_SLEEP_THRESHOLD_SECONDS}s | retry local {SOURCE_READ_LOCAL_RETRY_MAX_ATTEMPTS}x | "
                     f"paralelo {SOURCE_READ_PARALLEL_SESSIONS}x>{format_bytes(SOURCE_READ_PARALLEL_MIN_BYTES)} "
                     f"(orcamento/DC: slots {SOURCE_READ_SESSION_BUDGET}, pequenas {SOURCE_READ_SMALL_MAX_ACTIVE_PER_DC}, "
