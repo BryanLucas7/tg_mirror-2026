@@ -126,7 +126,7 @@ FAILED_ITEM_RETRY_BACKOFF_MAX_SECONDS = 180
 HEAD_PRESSURE_BACKGROUND_PREUPLOAD_LIMIT = 1
 HEAD_PRESSURE_READY_BACKLOG_THRESHOLD = 2
 LARGE_RELAY_DIAGNOSTIC_BYTES = 300 * 1024 * 1024
-LOG_MODE = os.getenv("FORWARD_LOG_MODE", "quiet").strip().lower() or "quiet"
+LOG_MODE = os.getenv("FORWARD_LOG_MODE", "normal").strip().lower() or "normal"
 DETAILED_LOG_TO_FILE = os.getenv("FORWARD_DETAILED_LOG", "0").strip().lower() not in {"0", "false", "no", "off"}
 DETAILED_LOG_DIR = os.path.abspath(os.getenv("FORWARD_LOG_DIR", os.path.join("forward_task", "logs")))
 ANALYTICS_TO_FILE = os.getenv("FORWARD_ANALYTICS", "0").strip().lower() not in {"0", "false", "no", "off"}
@@ -495,6 +495,7 @@ class CloneJobContext:
     analytics_item_state: dict = field(default_factory=dict)
     analytics_report: dict = field(default_factory=dict)
     source_download_mode: str = "takeout"
+    choices: List[int] = field(default_factory=list)
 
 @dataclass
 class MediaSessionPool:
@@ -1028,6 +1029,31 @@ def normalize_topic_title(title):
     title = (title or "Topico").strip()
     return title[:128] or "Topico"
 
+def _query_forum_topics(client, target_chat_id, topic_title):
+    input_channel = client.resolve_peer(target_chat_id)
+    forum_topics = client.invoke(
+        raw.functions.messages.GetForumTopics(
+            peer=input_channel,
+            offset_date=0,
+            offset_id=0,
+            offset_topic=0,
+            limit=100,
+            q=topic_title,
+        )
+    )
+    return [topic for topic in forum_topics.topics if getattr(topic, "title", None) == topic_title]
+
+def find_existing_forum_topic(client, target_chat_id, topic_title):
+    """Return the lowest-id topic in `target_chat_id` whose title equals `topic_title`, or None."""
+    topic_title = normalize_topic_title(topic_title)
+    try:
+        matches = _query_forum_topics(client, target_chat_id, topic_title)
+    except Exception:
+        return None
+    if not matches:
+        return None
+    return min(matches, key=lambda topic: getattr(topic, "id", 0)).id
+
 def create_forum_topic(client, target_chat_id, topic_title):
     topic_title = normalize_topic_title(topic_title)
     input_channel = client.resolve_peer(target_chat_id)
@@ -1041,22 +1067,22 @@ def create_forum_topic(client, target_chat_id, topic_title):
         )
     )
 
-    forum_topics = client.invoke(
-        raw.functions.messages.GetForumTopics(
-            peer=input_channel,
-            offset_date=0,
-            offset_id=0,
-            offset_topic=0,
-            limit=100,
-            q=topic_title,
-        )
-    )
-
-    matches = [topic for topic in forum_topics.topics if getattr(topic, "title", None) == topic_title]
+    matches = _query_forum_topics(client, target_chat_id, topic_title)
     if not matches:
         raise RuntimeError("Nao foi possivel localizar o topico criado no grupo de destino.")
 
     return max(matches, key=lambda topic: getattr(topic, "id", 0)).id
+
+def get_or_create_forum_topic(client, target_chat_id, topic_title):
+    """Reuse an existing topic with matching title if present, otherwise create a new one.
+
+    Returns a tuple ``(topic_id, reused: bool)``.
+    """
+    topic_title = normalize_topic_title(topic_title)
+    existing_id = find_existing_forum_topic(client, target_chat_id, topic_title)
+    if existing_id is not None:
+        return existing_id, True
+    return create_forum_topic(client, target_chat_id, topic_title), False
 
 def resolve_input_channel(client, chat_id):
     input_peer = client.resolve_peer(chat_id)
@@ -1156,10 +1182,11 @@ def resolve_target_destination(client, source_chat, target_chat):
         if not target_has_topics_enabled(target_chat, get_raw_target_channel(client, target_chat.id)):
             target_chat = enable_forum_topics(client, target_chat.id)
 
-        topic_id = create_forum_topic(client, target_chat.id, source_title)
+        topic_id, reused = get_or_create_forum_topic(client, target_chat.id, source_title)
         destination["thread_id"] = topic_id
         destination["mode_label"] = f"topico:{topic_id}"
-        print(f"Forum ativado e topico criado: '{normalize_topic_title(source_title)}' (ID {topic_id}).")
+        action = "reaproveitado" if reused else "criado"
+        print(f"Forum ativado e topico {action}: '{normalize_topic_title(source_title)}' (ID {topic_id}).")
         return destination
 
     if not target_can_use_topics(target_chat, raw_target_chat):
@@ -1169,10 +1196,13 @@ def resolve_target_destination(client, source_chat, target_chat):
     source_title = source_chat.title or "Topico"
 
     if target_has_topics_enabled(target_chat, raw_target_chat):
-        topic_id = create_forum_topic(client, target_chat.id, source_title)
+        topic_id, reused = get_or_create_forum_topic(client, target_chat.id, source_title)
         destination["thread_id"] = topic_id
         destination["mode_label"] = f"topico:{topic_id}"
-        print(f"Topico criado automaticamente no grupo de destino: '{normalize_topic_title(source_title)}' (ID {topic_id}).")
+        if reused:
+            print(f"Topico existente reaproveitado no grupo de destino: '{normalize_topic_title(source_title)}' (ID {topic_id}).")
+        else:
+            print(f"Topico criado automaticamente no grupo de destino: '{normalize_topic_title(source_title)}' (ID {topic_id}).")
         return destination
 
     print("O grupo de destino ainda nao esta usando topicos.")
@@ -1182,10 +1212,11 @@ def resolve_target_destination(client, source_chat, target_chat):
 
     if choice == "2":
         target_chat = enable_forum_topics(client, target_chat.id)
-        topic_id = create_forum_topic(client, target_chat.id, source_title)
+        topic_id, reused = get_or_create_forum_topic(client, target_chat.id, source_title)
         destination["thread_id"] = topic_id
         destination["mode_label"] = f"topico:{topic_id}"
-        print(f"Forum ativado e topico criado: '{normalize_topic_title(source_title)}' (ID {topic_id}).")
+        action = "reaproveitado" if reused else "criado"
+        print(f"Forum ativado e topico {action}: '{normalize_topic_title(source_title)}' (ID {topic_id}).")
         return destination
 
     print("O envio sera feito para o grupo em si, sem topico.")
@@ -6752,6 +6783,7 @@ async def forward_messages_from_channel(choices, channel_source, destination, ch
                 custom_caption=custom_caption,
                 progress_file=progress_file,
                 work_items=work_items,
+                choices=list(choices),
                 disk_budget=DiskBudgetManager(
                     MAX_LOCAL_DISK_BYTES_PER_JOB,
                     reserved_headroom_bytes=DISK_HEADROOM_BYTES,
