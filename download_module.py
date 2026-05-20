@@ -19,6 +19,8 @@ from utils import (
     create_run_download_dir,
     cleanup_run_download_dir,
     build_lock_name,
+    safe_download_media,
+    refresh_message_reference,
 )
 
 try:
@@ -50,7 +52,7 @@ def get_cleaned_file_path(media, directory, chat_title, caption=None):
     else:
         base_name = media.file_name or f"{media.file_id}"
 
-    extension = media.file_name.split('.')[-1] if media.file_name and '.' in media.file_name else unknown
+    extension = media.file_name.split('.')[-1] if media.file_name and '.' in media.file_name else 'unknown'
     clean_name = f"{base_name}.{extension}"
     
     # Aqui nós adicionamos o nome do canal ao caminho do diretório
@@ -116,12 +118,13 @@ def download_media_from_channel(choices, channel_source, chat_title):
         all_messages.reverse()
 
         for count, message in enumerate(all_messages):
+            message = refresh_message_reference(client, channel_source, message)
             file_name = None
             global bar
 
             if 1 in choices and message.photo:
                 bar = tqdm(total=message.photo.file_size, desc="Downloading Photo", leave=False)
-                file_name = client.download_media(message.photo, progress=download_progress)
+                file_name = safe_download_media(client, message.photo, progress=download_progress)
                 bar.close()
                
                 if file_name:
@@ -132,7 +135,7 @@ def download_media_from_channel(choices, channel_source, chat_title):
             
             if 2 in choices and message.audio:                
                 bar = tqdm(total=message.audio.file_size, desc="Downloading Audio", leave=False)
-                file_name = client.download_media(message.audio, progress=download_progress)
+                file_name = safe_download_media(client, message.audio, progress=download_progress)
                 bar.close()
 
                 if file_name:
@@ -144,13 +147,13 @@ def download_media_from_channel(choices, channel_source, chat_title):
             if 3 in choices and message.video:
                 bar = tqdm(total=message.video.file_size, desc="Downloading Video", leave=False)
                 file_name = get_cleaned_file_path(message.video, video_path, chat_title, message.caption)  # Aqui especificamos chat_title
-                client.download_media(message.video, file_name=file_name, progress=download_progress)
+                safe_download_media(client, message.video, file_name=file_name, progress=download_progress)
                 bar.close()
 
             if 4 in choices and message.document:
                 bar = tqdm(total=message.document.file_size, desc="Downloading Document", leave=False)
                 file_name = get_cleaned_file_path(message.document, video_path, chat_title)
-                client.download_media(message.document, file_name=file_name, progress=download_progress)
+                safe_download_media(client, message.document, file_name=file_name, progress=download_progress)
                 bar.close()
 
             if file_name:
@@ -165,7 +168,7 @@ if __name__ == "__main__":
     try:
         show_banner()
         cache_path()
-        session_name, runtime_lock_path = acquire_available_session(lock_prefix="session_download")
+        session_name, runtime_lock_path = acquire_available_session(lock_prefix="session")
         authenticate(session_name)
         run_id = build_run_id("download")
         run_download_path = create_run_download_dir(run_id)

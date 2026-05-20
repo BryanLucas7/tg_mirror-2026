@@ -6,6 +6,8 @@ __pycache__/
 # Pyrogram sessions (contêm credenciais!)
 *.session
 *.session-journal
+*.session.bak-*
+*.session-journal.bak-*
 
 # Ambientes virtuais
 venv/

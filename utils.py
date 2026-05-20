@@ -4,6 +4,7 @@ import asyncio
 import json
 import shutil
 import time
+import inspect
 from colorama import Fore
 import pyfiglet
 import random
@@ -14,6 +15,29 @@ except RuntimeError:
     asyncio.set_event_loop(asyncio.new_event_loop())
 
 from pyrogram import Client
+try:
+    from pyrogram.errors import FloodWait
+except ImportError:
+    FloodWait = None
+try:
+    from pyrogram.errors import FloodPremiumWait as _FloodPremiumWait
+except ImportError:
+    _FloodPremiumWait = None
+
+_FLOOD_WAIT_ERRORS = tuple(error for error in (FloodWait, _FloodPremiumWait) if error is not None)
+_AUTH_RETRY_TOKENS = (
+    "AUTH_BYTES_INVALID",
+    "FILE_REFERENCE_EXPIRED",
+)
+_NETWORK_RETRY_TOKENS = (
+    "UNABLE TO CONNECT",
+    "NETWORK",
+    "TIMED OUT",
+    "TIMEOUT",
+    "CONNECTION RESET",
+    "WINERROR 1231",
+    "ALREADY WAITING FOR INCOMING DATA",
+)
 
 def limpar_nome_arquivo(nome_arquivo):
     nome_limpo = re.sub(r'[^a-zA-Z0-9]', '_', nome_arquivo)
@@ -21,6 +45,82 @@ def limpar_nome_arquivo(nome_arquivo):
     for char in chars_invalidos:
         nome_limpo = nome_limpo.replace(char, '_')
     return nome_limpo
+
+def is_auth_bytes_invalid_error(error):
+    return "AUTH_BYTES_INVALID" in str(error).upper()
+
+def is_file_reference_expired_error(error):
+    return "FILE_REFERENCE_EXPIRED" in str(error).upper()
+
+def is_network_retryable_error(error):
+    normalized = str(error).upper()
+    return any(token in normalized for token in _NETWORK_RETRY_TOKENS)
+
+def is_retryable_telegram_error(error):
+    if _FLOOD_WAIT_ERRORS and isinstance(error, _FLOOD_WAIT_ERRORS):
+        return True
+    normalized = str(error).upper()
+    return any(token in normalized for token in _AUTH_RETRY_TOKENS) or is_network_retryable_error(error)
+
+def reset_pyrogram_media_sessions(client):
+    media_sessions = getattr(client, "media_sessions", None)
+    if not isinstance(media_sessions, dict):
+        return
+    for session in list(media_sessions.values()):
+        try:
+            stop = getattr(session, "stop", None)
+            if callable(stop):
+                result = stop()
+                if inspect.isawaitable(result):
+                    result.close()
+        except Exception:
+            pass
+    try:
+        media_sessions.clear()
+    except Exception:
+        pass
+
+def retry_pyrogram_call(operation, *args, client=None, attempts=4, base_sleep=2, operation_name="telegram", **kwargs):
+    for attempt in range(1, attempts + 1):
+        try:
+            return operation(*args, **kwargs)
+        except Exception as error:
+            if not is_retryable_telegram_error(error) or attempt >= attempts:
+                raise
+            if is_auth_bytes_invalid_error(error) or is_file_reference_expired_error(error):
+                reset_pyrogram_media_sessions(client)
+            if _FLOOD_WAIT_ERRORS and isinstance(error, _FLOOD_WAIT_ERRORS):
+                wait_seconds = max(1, int(getattr(error, "value", getattr(error, "x", base_sleep))))
+            else:
+                wait_seconds = min(30, base_sleep * attempt)
+            print(
+                f"[RETRY] {operation_name}: erro temporario ({str(error).splitlines()[0]}). "
+                f"Tentativa {attempt + 1}/{attempts} em {wait_seconds}s."
+            )
+            time.sleep(wait_seconds)
+
+def safe_download_media(client, media, *args, **kwargs):
+    return retry_pyrogram_call(
+        client.download_media,
+        media,
+        *args,
+        client=client,
+        operation_name="download_media",
+        **kwargs,
+    )
+
+def refresh_message_reference(client, chat_id, message):
+    try:
+        refreshed = retry_pyrogram_call(
+            client.get_messages,
+            chat_id,
+            message.id,
+            client=client,
+            operation_name="get_messages",
+        )
+        return refreshed or message
+    except Exception:
+        return message
 
 class Banner:
     def __init__(self, banner):

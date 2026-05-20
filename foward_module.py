@@ -108,6 +108,7 @@ SOURCE_READ_LARGE_MAX_ACTIVE_PER_DC_BURST = 3  # preset do run 667: libera um te
 SOURCE_READ_CHUNK_BYTES = 1024 * 1024
 SOURCE_READ_SLEEP_THRESHOLD_SECONDS = 20  # absorve waits pequenos no custom, como o path legacy faz internamente
 SOURCE_READ_LOCAL_RETRY_MAX_ATTEMPTS = 2  # retries locais evitam escalar limitacoes breves para retry global
+SOURCE_AUTH_IMPORT_MAX_ATTEMPTS = 3
 SOURCE_READ_LOCAL_RETRY_BACKOFF_BASE_SECONDS = 3
 SOURCE_READ_LOCAL_RETRY_BACKOFF_MAX_SECONDS = 10
 HEAD_PROTECTED_ITEMS = 3
@@ -880,6 +881,8 @@ def infer_retry_phase(item, error=None):
     error_text = str(error or "").upper()
     if "GETFILE" in error_text:
         return "source_read"
+    if "AUTH_BYTES_INVALID" in error_text:
+        return "source_auth"
     if "FILE_REFERENCE_EXPIRED" in error_text:
         return "refresh_reference"
     if "FLOOD" in error_text:
@@ -1460,6 +1463,8 @@ def simplify_error(error):
         return str(error)
     text = str(error)
     upper = text.upper()
+    if "AUTH_BYTES_INVALID" in upper:
+        return "autorizacao temporaria do DC de midia foi rejeitada, sera retentada."
     if "FILE_REFERENCE_EXPIRED" in upper:
         return "o Telegram expirou o acesso temporario a esta midia."
     if "FILE_PARTS_INVALID" in upper:
@@ -1489,6 +1494,8 @@ def is_retryable_failure_error(error_text):
         "temporario",
         "flood",
         "expirou o acesso temporario",
+        "autorizacao temporaria do dc",
+        "auth_bytes_invalid",
         "parte do arquivo invalida",
         "partes do arquivo faltando",
         "getfile",
@@ -1520,6 +1527,7 @@ def is_source_retryable_error(error):
     error_text = str(error).upper()
     return (
         "FLOOD" in error_text
+        or "AUTH_BYTES_INVALID" in error_text
         or "GETFILE" in error_text
         or "FILE_REFERENCE_EXPIRED" in error_text
         or "FILE_PART_INVALID" in error_text
@@ -1529,6 +1537,9 @@ def is_source_retryable_error(error):
 
 def is_file_reference_expired_error(error):
     return "FILE_REFERENCE_EXPIRED" in str(error).upper()
+
+def is_auth_bytes_invalid_error(error):
+    return "AUTH_BYTES_INVALID" in str(error).upper()
 
 def is_file_parts_invalid_error(error):
     return "FILE_PARTS_INVALID" in str(error).upper()
@@ -3955,14 +3966,8 @@ def build_source_download_location(source_ref):
         ),
     )
 
-async def open_source_read_workers(source_client, dc_id, session_count, context, item, stage_name):
-    home_dc_id = await source_client.storage.dc_id()
-    test_mode = await source_client.storage.test_mode()
-    exported_auth = None
-    shared_auth_key = None
-    worker_states = []
-
-    if dc_id != home_dc_id:
+async def import_source_authorization_for_worker(source_client, session, dc_id, context, item, stage_name):
+    for attempt in range(1, SOURCE_AUTH_IMPORT_MAX_ATTEMPTS + 1):
         exported_auth = await call_telegram(
             source_client.invoke,
             raw.functions.auth.ExportAuthorization(dc_id=dc_id),
@@ -3971,7 +3976,34 @@ async def open_source_read_workers(source_client, dc_id, session_count, context,
             _trace_item=item,
             _trace_phase=f"source_export_auth_{stage_name}",
         )
-    else:
+        try:
+            await call_telegram(
+                session.invoke,
+                raw.functions.auth.ImportAuthorization(id=exported_auth.id, bytes=exported_auth.bytes),
+                sleep_threshold=SOURCE_READ_SLEEP_THRESHOLD_SECONDS,
+                _metrics_context=context,
+                _trace_item=item,
+                _trace_phase=f"source_import_auth_{stage_name}",
+            )
+            return
+        except Exception as error:
+            if not is_auth_bytes_invalid_error(error) or attempt >= SOURCE_AUTH_IMPORT_MAX_ATTEMPTS:
+                raise
+            backoff = min(6, attempt * 2)
+            await log_context(
+                context,
+                f"[SOURCE] {item.label}: ImportAuthorization rejeitado no dc {dc_id}; "
+                f"renovando bytes de auth | tentativa {attempt + 1}/{SOURCE_AUTH_IMPORT_MAX_ATTEMPTS}",
+            )
+            await asyncio.sleep(backoff)
+
+async def open_source_read_workers(source_client, dc_id, session_count, context, item, stage_name):
+    home_dc_id = await source_client.storage.dc_id()
+    test_mode = await source_client.storage.test_mode()
+    shared_auth_key = None
+    worker_states = []
+
+    if dc_id == home_dc_id:
         shared_auth_key = await source_client.storage.auth_key()
 
     try:
@@ -3982,15 +4014,8 @@ async def open_source_read_workers(source_client, dc_id, session_count, context,
             session = Session(source_client, dc_id, auth_key, test_mode, is_media=True)
             await session.start()
             context.metrics["source_session_starts"] += 1
-            if exported_auth is not None:
-                await call_telegram(
-                    session.invoke,
-                    raw.functions.auth.ImportAuthorization(id=exported_auth.id, bytes=exported_auth.bytes),
-                    sleep_threshold=SOURCE_READ_SLEEP_THRESHOLD_SECONDS,
-                    _metrics_context=context,
-                    _trace_item=item,
-                    _trace_phase=f"source_import_auth_{stage_name}",
-                )
+            if dc_id != home_dc_id:
+                await import_source_authorization_for_worker(source_client, session, dc_id, context, item, stage_name)
             worker_states.append({"session": session, "cdn_session": None, "cdn_redirect": None})
         return worker_states
     except Exception:
@@ -4122,7 +4147,7 @@ async def fetch_source_offset_chunk_with_retry(source_client, worker_state, loca
                 cdn_logged,
             )
         except Exception as error:
-            if is_file_reference_expired_error(error):
+            if is_file_reference_expired_error(error) or is_auth_bytes_invalid_error(error):
                 raise
             if not is_source_retryable_error(error):
                 raise
@@ -4167,7 +4192,10 @@ async def stream_source_media_from_legacy_offset(source_client, source_ref, star
                 current_offset += 1
             return
         except Exception as error:
-            if not is_file_reference_expired_error(error) or refresh_attempts >= SOURCE_REFERENCE_REFRESH_MAX_ATTEMPTS:
+            if (
+                not (is_file_reference_expired_error(error) or is_auth_bytes_invalid_error(error))
+                or refresh_attempts >= SOURCE_REFERENCE_REFRESH_MAX_ATTEMPTS
+            ):
                 raise
             refresh_attempts += 1
             current_ref = await refresh_source_ref(source_client, context, item, current_ref, stage_name)
@@ -4313,7 +4341,7 @@ async def stream_source_media(source_client, context, item, source_ref, file_siz
                 f"motivo {simplify_error(error)} | retomando do chunk {next_expected_chunk}",
             )
             fallback_ref = source_ref
-            if is_file_reference_expired_error(error):
+            if is_file_reference_expired_error(error) or is_auth_bytes_invalid_error(error):
                 fallback_ref = await refresh_source_ref(source_client, context, item, source_ref, stage_name)
             async for chunk in stream_source_media_from_legacy_offset(
                 source_client,
@@ -4959,7 +4987,7 @@ async def relay_upload_media_reference_with_retry(source_client, upload_client, 
             error_upper = str(error).upper()
             if attempt >= attempts - 1:
                 raise
-            if "FILE_REFERENCE_EXPIRED" in error_upper:
+            if "FILE_REFERENCE_EXPIRED" in error_upper or "AUTH_BYTES_INVALID" in error_upper:
                 # Limpa o resume state antes de retry: partes uploadadas com a referencia antiga
                 # podem estar em estado incerto no storage do Telegram, causando FILE_PART_X_MISSING.
                 # Comecar do zero com novo file_id e novo source stream eh mais seguro.
@@ -5250,7 +5278,7 @@ async def preupload_item(source_client, preupload_client, destination_peer, cont
                 error_text = str(error).upper()
                 if isinstance(error, MessageDeletedError):
                     raise
-                if item.stream_relay and "FILE_REFERENCE_EXPIRED" in error_text:
+                if item.stream_relay and ("FILE_REFERENCE_EXPIRED" in error_text or "AUTH_BYTES_INVALID" in error_text):
                     item.upload_resume_states.clear()
                 # FILE_PART_X_MISSING durante stream relay indica estado de partes inconsistente.
                 # Reiniciar indefinidamente aqui costuma repetir o mesmo arquivo quebrado no servidor.
@@ -5262,6 +5290,7 @@ async def preupload_item(source_client, preupload_client, destination_peer, cont
                     raise
                 is_transient = (
                     "FLOOD" in error_text
+                    or "AUTH_BYTES_INVALID" in error_text
                     or "GETFILE" in error_text
                     or "FILE_REFERENCE_EXPIRED" in error_text
                     or "FILE_PART_INVALID" in error_text
@@ -5374,7 +5403,10 @@ async def download_media_with_retry(client, context, item, message, file_name, a
                 _trace_phase="download_media",
             ), current_message
         except Exception as error:
-            if "FILE_REFERENCE_EXPIRED" in str(error).upper() and attempt < attempts - 1:
+            if (
+                ("FILE_REFERENCE_EXPIRED" in str(error).upper() or "AUTH_BYTES_INVALID" in str(error).upper())
+                and attempt < attempts - 1
+            ):
                 current_message = await refresh_message(client, current_message)
                 await asyncio.sleep(1)
                 continue
@@ -5627,7 +5659,10 @@ async def send_server_copy_single_message(client, context, item):
             )
             break
         except Exception as error:
-            if not is_file_reference_expired_error(error) or attempt >= SOURCE_REFERENCE_REFRESH_MAX_ATTEMPTS - 1:
+            if (
+                not (is_file_reference_expired_error(error) or is_auth_bytes_invalid_error(error))
+                or attempt >= SOURCE_REFERENCE_REFRESH_MAX_ATTEMPTS - 1
+            ):
                 raise
             await asyncio.sleep(1)
     await send_overflow_text(client, context.destination, item.overflow_text)
@@ -5646,7 +5681,10 @@ async def send_server_copy_album(client, context, item):
             )
             break
         except Exception as error:
-            if not is_file_reference_expired_error(error) or attempt >= SOURCE_REFERENCE_REFRESH_MAX_ATTEMPTS - 1:
+            if (
+                not (is_file_reference_expired_error(error) or is_auth_bytes_invalid_error(error))
+                or attempt >= SOURCE_REFERENCE_REFRESH_MAX_ATTEMPTS - 1
+            ):
                 raise
             await asyncio.sleep(1)
     await send_overflow_text(client, context.destination, item.overflow_text)
@@ -6603,7 +6641,7 @@ if __name__ == "__main__":
     run_download_path = None
     try:
         show_banner()
-        session_name, runtime_lock_path = acquire_available_session(lock_prefix="session_forward")
+        session_name, runtime_lock_path = acquire_available_session(lock_prefix="session")
         authenticate(session_name)
         cache_path()
         job_count = get_batch_job_count()

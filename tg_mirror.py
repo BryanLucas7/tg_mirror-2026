@@ -17,6 +17,9 @@ from utils import (
     create_run_download_dir,
     cleanup_run_download_dir,
     build_lock_name,
+    safe_download_media,
+    retry_pyrogram_call,
+    refresh_message_reference,
 )
 import re
 import shutil
@@ -188,7 +191,7 @@ def send_video_with_metadata(client, channel_target, message, file_name, caption
         kwargs["thumb"] = thumbnail_path
 
     try:
-        client.send_video(**kwargs)
+        retry_pyrogram_call(client.send_video, client=client, operation_name="send_video", **kwargs)
     finally:
         if thumbnail_path and os.path.exists(thumbnail_path):
             os.remove(thumbnail_path)
@@ -247,7 +250,7 @@ def send_media_group_with_reupload(client, album_messages, channel_target):
         for index, message in enumerate(album_messages):
             media = message.photo or message.video or message.audio or message.document
             file_name = get_cleaned_file_path(media, video_path)
-            client.download_media(media, file_name=file_name)
+            safe_download_media(client, media, file_name=file_name)
             files_to_remove.append(file_name)
 
             caption_text = build_caption(message) if index == 0 else ""
@@ -257,7 +260,13 @@ def send_media_group_with_reupload(client, album_messages, channel_target):
                 thumbs_to_remove.append(thumb)
             media_group.append(input_media)
 
-        client.send_media_group(channel_target, media_group)
+        retry_pyrogram_call(
+            client.send_media_group,
+            channel_target,
+            media_group,
+            client=client,
+            operation_name="send_media_group",
+        )
     finally:
         cleanup_paths(thumbs_to_remove)
         cleanup_paths(files_to_remove)
@@ -313,6 +322,10 @@ def download_and_upload_media_from_channel(choices, channel_source, channel_targ
 
                 if all(message_matches_choices(item, choices) and is_album_compatible(item) for item in album_messages):
                     try:
+                        album_messages = [
+                            refresh_message_reference(client, channel_source, item)
+                            for item in album_messages
+                        ]
                         send_media_group_with_reupload(client, album_messages, channel_target)
                         last_processed_id = album_messages[-1].id
                         with open(json_filepath, "w") as json_file:
@@ -326,6 +339,7 @@ def download_and_upload_media_from_channel(choices, channel_source, channel_targ
                     continue
 
             file_name = None
+            message = refresh_message_reference(client, channel_source, message)
             caption_text = build_caption(message)
             download_start_time = None
             last_update_time = None
@@ -353,21 +367,37 @@ def download_and_upload_media_from_channel(choices, channel_source, channel_targ
             if 1 in choices and message.photo:
                 file_size = message.photo.file_size
                 bar = tqdm(total=file_size, desc="Downloading", leave=False)
-                file_name = client.download_media(message.photo, progress=progress)
-                client.send_photo(channel_target, file_name, caption=caption_text, progress=lambda c, t: progress(c, t, "Uploading"))
+                file_name = safe_download_media(client, message.photo, progress=progress)
+                retry_pyrogram_call(
+                    client.send_photo,
+                    channel_target,
+                    file_name,
+                    caption=caption_text,
+                    progress=lambda c, t: progress(c, t, "Uploading"),
+                    client=client,
+                    operation_name="send_photo",
+                )
 
             if 2 in choices and message.audio:
                 file_size = message.audio.file_size
                 bar = tqdm(total=file_size, desc="Downloading", leave=False)
                 file_name = get_cleaned_file_path(message.audio, video_path)
-                client.download_media(message.audio, file_name=file_name, progress=lambda c, t: progress(c, t, "Downloading"))
-                client.send_audio(channel_target, file_name, caption=caption_text, progress=lambda c, t: progress(c, t, "Uploading"))
+                safe_download_media(client, message.audio, file_name=file_name, progress=lambda c, t: progress(c, t, "Downloading"))
+                retry_pyrogram_call(
+                    client.send_audio,
+                    channel_target,
+                    file_name,
+                    caption=caption_text,
+                    progress=lambda c, t: progress(c, t, "Uploading"),
+                    client=client,
+                    operation_name="send_audio",
+                )
 
             if 3 in choices and message.video:
                 file_size = message.video.file_size
                 bar = tqdm(total=file_size, desc="Downloading", leave=False)
                 file_name = get_cleaned_file_path(message.video, video_path)
-                client.download_media(message.video, file_name=file_name, progress=lambda c, t: progress(c, t, "Downloading"))
+                safe_download_media(client, message.video, file_name=file_name, progress=lambda c, t: progress(c, t, "Downloading"))
                 bar = tqdm(total=file_size, desc="Uploading ...", leave=False)
                 send_video_with_metadata(
                     client,
@@ -382,22 +412,48 @@ def download_and_upload_media_from_channel(choices, channel_source, channel_targ
                 file_size = message.document.file_size
                 bar = tqdm(total=file_size, desc="Downloading", leave=False)
                 file_name = get_cleaned_file_path(message.document, video_path)
-                client.download_media(message.document, file_name=file_name, progress=progress)
-                client.send_document(channel_target, file_name, caption=caption_text, progress=progress)
+                safe_download_media(client, message.document, file_name=file_name, progress=progress)
+                retry_pyrogram_call(
+                    client.send_document,
+                    channel_target,
+                    file_name,
+                    caption=caption_text,
+                    progress=progress,
+                    client=client,
+                    operation_name="send_document",
+                )
 
             if 5 in choices and message.text:
                 text_with_links = (message.text + ' ' + extract_links_from_buttons(message.reply_markup)).strip()
-                client.send_message(channel_target, text_with_links)
+                retry_pyrogram_call(
+                    client.send_message,
+                    channel_target,
+                    text_with_links,
+                    client=client,
+                    operation_name="send_message",
+                )
 
             if 6 in choices and message.sticker:
                 file_name = get_cleaned_file_path(message.sticker, video_path)
-                client.download_media(message.sticker, file_name=file_name)
-                client.send_sticker(channel_target, file_name)
+                safe_download_media(client, message.sticker, file_name=file_name)
+                retry_pyrogram_call(
+                    client.send_sticker,
+                    channel_target,
+                    file_name,
+                    client=client,
+                    operation_name="send_sticker",
+                )
 
             if 7 in choices and message.animation:
                 file_name = get_cleaned_file_path(message.animation, video_path)
-                client.download_media(message.animation, file_name=file_name)
-                client.send_animation(channel_target, file_name)
+                safe_download_media(client, message.animation, file_name=file_name)
+                retry_pyrogram_call(
+                    client.send_animation,
+                    channel_target,
+                    file_name,
+                    client=client,
+                    operation_name="send_animation",
+                )
             if file_name:                            
                 last_processed_id = message.id
                 with open(json_filepath, "w") as json_file:
@@ -414,7 +470,7 @@ if __name__ == "__main__":
     try:
         show_banner()
         cache_path()
-        session_name, runtime_lock_path = acquire_available_session(lock_prefix="session_forward")
+        session_name, runtime_lock_path = acquire_available_session(lock_prefix="session")
         authenticate(session_name)
         run_id = build_run_id("mirror")
         run_download_path = create_run_download_dir(run_id)
