@@ -1032,8 +1032,8 @@ def create_forum_topic(client, target_chat_id, topic_title):
     input_channel = client.resolve_peer(target_chat_id)
 
     client.invoke(
-        raw.functions.channels.CreateForumTopic(
-            channel=input_channel,
+        raw.functions.messages.CreateForumTopic(
+            peer=input_channel,
             title=topic_title,
             random_id=random.randrange(1, 1 << 63),
             icon_color=0x6FB9F0,
@@ -1041,8 +1041,8 @@ def create_forum_topic(client, target_chat_id, topic_title):
     )
 
     forum_topics = client.invoke(
-        raw.functions.channels.GetForumTopics(
-            channel=input_channel,
+        raw.functions.messages.GetForumTopics(
+            peer=input_channel,
             offset_date=0,
             offset_id=0,
             offset_topic=0,
@@ -1056,6 +1056,55 @@ def create_forum_topic(client, target_chat_id, topic_title):
         raise RuntimeError("Nao foi possivel localizar o topico criado no grupo de destino.")
 
     return max(matches, key=lambda topic: getattr(topic, "id", 0)).id
+
+def resolve_input_channel(client, chat_id):
+    input_peer = client.resolve_peer(chat_id)
+    if not isinstance(input_peer, raw.types.InputPeerChannel):
+        return None
+    return raw.types.InputChannel(
+        channel_id=input_peer.channel_id,
+        access_hash=input_peer.access_hash,
+    )
+
+def get_raw_target_channel(client, chat_id):
+    input_channel = resolve_input_channel(client, chat_id)
+    if input_channel is None:
+        return None
+    try:
+        full = client.invoke(raw.functions.channels.GetFullChannel(channel=input_channel))
+    except Exception:
+        return None
+    for chat in getattr(full, "chats", []) or []:
+        if getattr(chat, "id", None) == input_channel.channel_id:
+            return chat
+    return None
+
+def target_can_use_topics(target_chat, raw_target_chat=None):
+    if getattr(target_chat, "is_forum", False):
+        return True
+    if raw_target_chat is not None:
+        if getattr(raw_target_chat, "forum", False):
+            return True
+        if getattr(raw_target_chat, "megagroup", False) and not getattr(raw_target_chat, "broadcast", False):
+            return True
+    return target_chat.type == pyrogram.enums.ChatType.SUPERGROUP
+
+def target_has_topics_enabled(target_chat, raw_target_chat=None):
+    return bool(getattr(target_chat, "is_forum", False) or getattr(raw_target_chat, "forum", False))
+
+def enable_forum_topics(client, target_chat_id):
+    input_channel = resolve_input_channel(client, target_chat_id)
+    if input_channel is None:
+        raise RuntimeError("O destino nao e um supergrupo/canal apto a topicos.")
+    client.invoke(
+        raw.functions.channels.ToggleForum(
+            channel=input_channel,
+            enabled=True,
+            tabs=False,
+        )
+    )
+    time.sleep(1)
+    return client.get_chat(target_chat_id)
 
 def extract_migrated_supergroup_id(updates):
     for chat in reversed(getattr(updates, "chats", [])):
@@ -1080,8 +1129,9 @@ def resolve_target_destination(client, source_chat, target_chat):
         "thread_id": None,
         "mode_label": "chat",
     }
+    raw_target_chat = get_raw_target_channel(client, target_chat.id)
 
-    if target_chat.type == pyrogram.enums.ChatType.CHANNEL:
+    if target_chat.type == pyrogram.enums.ChatType.CHANNEL and not target_can_use_topics(target_chat, raw_target_chat):
         return destination
 
     if target_chat.type == pyrogram.enums.ChatType.GROUP:
@@ -1102,14 +1152,8 @@ def resolve_target_destination(client, source_chat, target_chat):
         destination["chat_id"] = migrated_chat.id
         source_title = source_chat.title or "Topico"
 
-        if not getattr(target_chat, "is_forum", False):
-            input_channel = client.resolve_peer(target_chat.id)
-            client.invoke(
-                raw.functions.channels.ToggleForum(
-                    channel=input_channel,
-                    enabled=True,
-                )
-            )
+        if not target_has_topics_enabled(target_chat, get_raw_target_channel(client, target_chat.id)):
+            target_chat = enable_forum_topics(client, target_chat.id)
 
         topic_id = create_forum_topic(client, target_chat.id, source_title)
         destination["thread_id"] = topic_id
@@ -1117,13 +1161,13 @@ def resolve_target_destination(client, source_chat, target_chat):
         print(f"Forum ativado e topico criado: '{normalize_topic_title(source_title)}' (ID {topic_id}).")
         return destination
 
-    if target_chat.type != pyrogram.enums.ChatType.SUPERGROUP:
+    if not target_can_use_topics(target_chat, raw_target_chat):
         print("Destino sem suporte a topicos. O envio sera feito para o chat em si.")
         return destination
 
     source_title = source_chat.title or "Topico"
 
-    if getattr(target_chat, "is_forum", False):
+    if target_has_topics_enabled(target_chat, raw_target_chat):
         topic_id = create_forum_topic(client, target_chat.id, source_title)
         destination["thread_id"] = topic_id
         destination["mode_label"] = f"topico:{topic_id}"
@@ -1136,13 +1180,7 @@ def resolve_target_destination(client, source_chat, target_chat):
     choice = input("Escolha (1/2): ").strip() or "1"
 
     if choice == "2":
-        input_channel = client.resolve_peer(target_chat.id)
-        client.invoke(
-            raw.functions.channels.ToggleForum(
-                channel=input_channel,
-                enabled=True,
-            )
-        )
+        target_chat = enable_forum_topics(client, target_chat.id)
         topic_id = create_forum_topic(client, target_chat.id, source_title)
         destination["thread_id"] = topic_id
         destination["mode_label"] = f"topico:{topic_id}"
@@ -2687,6 +2725,23 @@ async def refresh_message(client, message):
         )
     return refreshed or message
 
+async def reset_async_media_sessions(client):
+    media_sessions = getattr(client, "media_sessions", None)
+    if not isinstance(media_sessions, dict):
+        return
+    sessions = list(media_sessions.values())
+    try:
+        media_sessions.clear()
+    except Exception:
+        pass
+    for session in sessions:
+        try:
+            result = session.stop()
+            if inspect.isawaitable(result):
+                await result
+        except Exception:
+            pass
+
 def replace_item_message_reference(item, old_message, refreshed_message):
     if item is None or old_message is None or refreshed_message is None:
         return
@@ -4198,8 +4253,60 @@ async def stream_source_media_from_legacy_offset(source_client, source_ref, star
             ):
                 raise
             refresh_attempts += 1
+            if is_auth_bytes_invalid_error(error):
+                await reset_async_media_sessions(source_client)
+                if context is not None and item is not None:
+                    await log_context(
+                        context,
+                        f"[SOURCE] {item.label}: AUTH_BYTES_INVALID no leitor legacy; media sessions resetadas",
+                    )
             current_ref = await refresh_source_ref(source_client, context, item, current_ref, stage_name)
             await asyncio.sleep(1)
+
+async def stream_source_media_custom_offset(source_client, source_ref, file_size, start_chunk_index, context, item, stage_name, session_count=1):
+    current_ref = source_ref
+    current_chunk = max(0, int(start_chunk_index or 0))
+    total_chunks = int(math.ceil(file_size / SOURCE_READ_CHUNK_BYTES)) if file_size else 0
+    refresh_attempts = 0
+    while current_chunk < total_chunks:
+        dc_id, location = build_source_download_location(current_ref)
+        budget_bucket = None
+        worker_states = []
+        try:
+            budget_bucket = await acquire_source_budget(context, item, dc_id, session_count, file_size)
+            worker_states = await open_source_read_workers(source_client, dc_id, session_count, context, item, stage_name)
+            cdn_logged = {"value": False}
+            while current_chunk < total_chunks:
+                worker_state = worker_states[current_chunk % len(worker_states)]
+                offset_bytes = current_chunk * SOURCE_READ_CHUNK_BYTES
+                chunk = await fetch_source_offset_chunk_with_retry(
+                    source_client,
+                    worker_state,
+                    location,
+                    offset_bytes,
+                    context,
+                    item,
+                    stage_name,
+                    cdn_logged,
+                )
+                yield chunk
+                current_chunk += 1
+            return
+        except Exception as error:
+            if (
+                not (is_file_reference_expired_error(error) or is_auth_bytes_invalid_error(error))
+                or refresh_attempts >= SOURCE_REFERENCE_REFRESH_MAX_ATTEMPTS
+            ):
+                raise
+            refresh_attempts += 1
+            if is_auth_bytes_invalid_error(error):
+                await reset_async_media_sessions(source_client)
+            current_ref = await refresh_source_ref(source_client, context, item, current_ref, stage_name)
+            await asyncio.sleep(1)
+        finally:
+            await close_source_read_workers(worker_states)
+            if budget_bucket is not None:
+                await release_source_budget(context, dc_id, session_count, budget_bucket, file_size)
 
 async def stream_source_media(source_client, context, item, source_ref, file_size, stage_name):
     mode, session_count = get_source_reader_mode(file_size, stage_name)
@@ -4461,14 +4568,41 @@ async def stream_relay_input_file_baseline(source_client, upload_client, context
 
             file_part = 0
             pending = bytearray()
-            source_stream = stream_source_media_from_legacy_offset(
-                source_client,
-                source_ref,
-                0,
-                context=context,
-                item=item,
-                stage_name=stage_name,
-            ).__aiter__()
+            source_home_dc_id = None
+            try:
+                source_home_dc_id = await source_client.storage.dc_id()
+            except Exception:
+                source_home_dc_id = None
+            use_custom_source_reader = bool(getattr(item, "force_custom_source_reader", False))
+            if source_dc_id is not None and source_home_dc_id is not None and source_dc_id != source_home_dc_id:
+                use_custom_source_reader = True
+            if use_custom_source_reader:
+                if stage_name == "main":
+                    set_item_source_mode(context, item, "custom", dc_id=source_dc_id, final=True)
+                if should_log_large_relay(item, file_size):
+                    await log_context(
+                        context,
+                        f"[RELAY] {item.label}: origem cross-DC/auth sensivel; usando leitor custom em {stage_name}",
+                    )
+                source_stream = stream_source_media_custom_offset(
+                    source_client,
+                    source_ref,
+                    file_size,
+                    0,
+                    context,
+                    item,
+                    stage_name,
+                    session_count=1,
+                ).__aiter__()
+            else:
+                source_stream = stream_source_media_from_legacy_offset(
+                    source_client,
+                    source_ref,
+                    0,
+                    context=context,
+                    item=item,
+                    stage_name=stage_name,
+                ).__aiter__()
 
             while True:
                 source_read_started_at = time.time()
@@ -5280,6 +5414,8 @@ async def preupload_item(source_client, preupload_client, destination_peer, cont
                     raise
                 if item.stream_relay and ("FILE_REFERENCE_EXPIRED" in error_text or "AUTH_BYTES_INVALID" in error_text):
                     item.upload_resume_states.clear()
+                if item.stream_relay and "AUTH_BYTES_INVALID" in error_text:
+                    item.force_custom_source_reader = True
                 # FILE_PART_X_MISSING durante stream relay indica estado de partes inconsistente.
                 # Reiniciar indefinidamente aqui costuma repetir o mesmo arquivo quebrado no servidor.
                 if item.stream_relay and (
@@ -5407,6 +5543,8 @@ async def download_media_with_retry(client, context, item, message, file_name, a
                 ("FILE_REFERENCE_EXPIRED" in str(error).upper() or "AUTH_BYTES_INVALID" in str(error).upper())
                 and attempt < attempts - 1
             ):
+                if "AUTH_BYTES_INVALID" in str(error).upper():
+                    await reset_async_media_sessions(client)
                 current_message = await refresh_message(client, current_message)
                 await asyncio.sleep(1)
                 continue
