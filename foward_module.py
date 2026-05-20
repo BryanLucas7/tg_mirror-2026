@@ -6342,7 +6342,13 @@ async def publisher_loop(client, context):
                     context,
                     f"[PUB] {item.label}: pulado — mensagem confirmada como deletada da origem.",
                 )
-                save_progress(context.progress_file, item.last_message_id)
+                save_progress(
+                    context.progress_file,
+                    item.last_message_id,
+                    context.channel_source,
+                    context.destination,
+                    context.choices,
+                )
                 context.next_seq_to_publish += 1
                 await schedule_more_items(context)
                 await notify_pipeline_slots(context)
@@ -6374,7 +6380,13 @@ async def publisher_loop(client, context):
                     context,
                     f"[PUB] {item.label}: pulado — mensagem confirmada como deletada da origem.",
                 )
-                save_progress(context.progress_file, item.last_message_id)
+                save_progress(
+                    context.progress_file,
+                    item.last_message_id,
+                    context.channel_source,
+                    context.destination,
+                    context.choices,
+                )
                 context.next_seq_to_publish += 1
                 await schedule_more_items(context)
                 await notify_pipeline_slots(context)
@@ -6393,7 +6405,13 @@ async def publisher_loop(client, context):
             item.aux_paths = []
             item.local_paths = []
 
-        save_progress(context.progress_file, item.last_message_id)
+        save_progress(
+            context.progress_file,
+            item.last_message_id,
+            context.channel_source,
+            context.destination,
+            context.choices,
+        )
         item.state = "done"
         context.success_count += 1
         await log_item_completion(context, item, True)
@@ -6408,24 +6426,60 @@ def clean_filename(filename):
     filename = filename.strip().strip('.')
     return filename    
 
-def generate_progress_filename(channel_source, destination, chat_title):
+def normalize_choices_for_progress(choices):
+    return "-".join(str(choice) for choice in sorted(set(int(choice) for choice in choices)))
+
+def build_progress_scope(channel_source, destination, choices):
+    return {
+        "source_chat_id": int(channel_source),
+        "destination_chat_id": int(destination["chat_id"]),
+        "destination_thread_id": destination.get("thread_id") or "chat",
+        "content_choices": normalize_choices_for_progress(choices),
+    }
+
+def build_progress_scope_key(channel_source, destination, choices):
+    scope = build_progress_scope(channel_source, destination, choices)
+    return (
+        f"src_{scope['source_chat_id']}"
+        f"__dst_{scope['destination_chat_id']}"
+        f"__topic_{scope['destination_thread_id']}"
+        f"__types_{scope['content_choices']}"
+    )
+
+def generate_progress_filename(channel_source, destination, choices):
+    cleaned_filename = clean_filename(f"{build_progress_scope_key(channel_source, destination, choices)}.json")
+    return os.path.join("forward_task", cleaned_filename)
+
+def generate_legacy_progress_filename(channel_source, destination, chat_title):
     filename = (
         f"{session_name}_{chat_title}_{channel_source}_"
         f"{destination['chat_id']}_{destination.get('thread_id') or 'chat'}.json"
     )
-    cleaned_filename = clean_filename(filename)
-    return os.path.join("forward_task", cleaned_filename)
+    return os.path.join("forward_task", clean_filename(filename))
 
-def save_progress(filename, last_message_id):
+def save_progress(filename, last_message_id, channel_source=None, destination=None, choices=None):
+    payload = {'last_message_id': last_message_id}
+    if channel_source is not None and destination is not None and choices is not None:
+        payload["scope"] = build_progress_scope(channel_source, destination, choices)
+    os.makedirs(os.path.dirname(filename) or ".", exist_ok=True)
     with open(filename, 'w') as file:
-        json.dump({'last_message_id': last_message_id}, file)
+        json.dump(payload, file, ensure_ascii=False, indent=2)
 
 def get_previous_progress(filename):
     if os.path.exists(filename):
         with open(filename, 'r') as file:
             data = json.load(file)
             return data.get('last_message_id')
-    return None        
+    return None
+
+def migrate_legacy_progress_if_needed(progress_file, legacy_progress_file, channel_source, destination, choices):
+    if os.path.exists(progress_file) or not os.path.exists(legacy_progress_file):
+        return None
+    last_message_id = get_previous_progress(legacy_progress_file)
+    if not last_message_id:
+        return None
+    save_progress(progress_file, last_message_id, channel_source, destination, choices)
+    return last_message_id
 
 def choose_resume_mode(progress_file, last_processed_msg_id):
     if not last_processed_msg_id:
@@ -6470,8 +6524,18 @@ def build_work_queue(messages, choices):
 async def forward_messages_from_channel(choices, channel_source, destination, chat_title, custom_caption=None):
     if custom_caption is None:
         custom_caption = get_custom_caption()
-    progress_file = generate_progress_filename(channel_source, destination, chat_title)
+    progress_file = generate_progress_filename(channel_source, destination, choices)
+    legacy_progress_file = generate_legacy_progress_filename(channel_source, destination, chat_title)
+    migrated_last_processed_msg_id = migrate_legacy_progress_if_needed(
+        progress_file,
+        legacy_progress_file,
+        channel_source,
+        destination,
+        choices,
+    )
     last_processed_msg_id = get_previous_progress(progress_file)
+    if migrated_last_processed_msg_id and not last_processed_msg_id:
+        last_processed_msg_id = migrated_last_processed_msg_id
     last_processed_msg_id = choose_resume_mode(progress_file, last_processed_msg_id)
 
     async with Client(
