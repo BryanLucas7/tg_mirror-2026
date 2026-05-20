@@ -1588,10 +1588,14 @@ def get_upload_max_file_parts(upload_client):
         return TELEGRAM_UPLOAD_MAX_FILE_PARTS_PREMIUM
     return TELEGRAM_UPLOAD_MAX_FILE_PARTS
 
-def build_relay_upload_part_plan(upload_client, file_size):
+def build_upload_part_count(file_size, part_size=TELEGRAM_UPLOAD_PART_SIZE):
+    size = max(0, int(file_size or 0))
+    return int(math.ceil(size / part_size)) or 1
+
+def assert_upload_part_limit(upload_client, file_size):
     size = max(0, int(file_size or 0))
     part_size = TELEGRAM_UPLOAD_PART_SIZE
-    file_total_parts = int(math.ceil(size / part_size)) or 1
+    file_total_parts = build_upload_part_count(size)
     max_parts = get_upload_max_file_parts(upload_client)
     if file_total_parts > max_parts:
         max_bytes = max_parts * part_size
@@ -1599,7 +1603,22 @@ def build_relay_upload_part_plan(upload_client, file_size):
             f"arquivo com {format_bytes(size)} excede o limite de upload desta sessao "
             f"({format_bytes(max_bytes)}; partes {file_total_parts}/{max_parts})."
         )
+    return file_total_parts
+
+def is_within_upload_part_limit(upload_client, file_size):
+    return build_upload_part_count(file_size) <= get_upload_max_file_parts(upload_client)
+
+def build_relay_upload_part_plan(upload_client, file_size):
+    part_size = TELEGRAM_UPLOAD_PART_SIZE
+    file_total_parts = assert_upload_part_limit(upload_client, file_size)
     return part_size, file_total_parts
+
+def preflight_local_upload_file(upload_client, file_name):
+    try:
+        file_size = os.path.getsize(file_name)
+    except OSError:
+        return
+    assert_upload_part_limit(upload_client, file_size)
 
 def should_use_server_copy_fallback(error):
     return isinstance(error, UploadTooLargeForRelayError) or is_file_parts_invalid_error(error)
@@ -5113,6 +5132,7 @@ async def relay_upload_media_reference_with_retry(source_client, upload_client, 
     except Exception:
         current_message = message  # se refresh falhar por problema de rede, continua com o original; retry cuida do resto
 
+    clean_retry_after_parts_invalid = False
     for attempt in range(attempts):
         try:
             remote_media = await relay_upload_media_reference(source_client, upload_client, peer, context, item, current_message)
@@ -5121,6 +5141,24 @@ async def relay_upload_media_reference_with_retry(source_client, upload_client, 
             error_upper = str(error).upper()
             if attempt >= attempts - 1:
                 raise
+            if is_file_parts_invalid_error(error):
+                media_size = get_media_size(current_message)
+                if not is_within_upload_part_limit(upload_client, media_size):
+                    raise UploadTooLargeForRelayError(
+                        f"arquivo com {format_bytes(media_size)} excede o limite de upload desta sessao "
+                        f"(partes {build_upload_part_count(media_size)}/{get_upload_max_file_parts(upload_client)})."
+                    )
+                if clean_retry_after_parts_invalid:
+                    raise
+                clean_retry_after_parts_invalid = True
+                item.upload_resume_states.clear()
+                await log_context(
+                    context,
+                    f"[RELAY] {item.label}: FILE_PARTS_INVALID dentro do limite; "
+                    "reiniciando upload do zero antes de fallback server-side.",
+                )
+                await asyncio.sleep(2)
+                continue
             if "FILE_REFERENCE_EXPIRED" in error_upper or "AUTH_BYTES_INVALID" in error_upper:
                 # Limpa o resume state antes de retry: partes uploadadas com a referencia antiga
                 # podem estar em estado incerto no storage do Telegram, causando FILE_PART_X_MISSING.
@@ -5138,6 +5176,7 @@ async def relay_upload_media_reference_with_retry(source_client, upload_client, 
             raise
 
 async def upload_media_reference(upload_client, peer, message, file_name, thumb_path=None):
+    preflight_local_upload_file(upload_client, file_name)
     if message.photo:
         uploaded = await call_telegram(
             upload_client.invoke,
@@ -5258,6 +5297,33 @@ async def upload_media_reference(upload_client, peer, message, file_name, thumb_
 
     raise RuntimeError("Tipo de mídia não suportado para pre-upload.")
 
+async def upload_media_reference_with_retry(upload_client, peer, context, item, message, file_name, thumb_path=None):
+    clean_retry_after_parts_invalid = False
+    while True:
+        try:
+            return await upload_media_reference(upload_client, peer, message, file_name, thumb_path)
+        except Exception as error:
+            if not is_file_parts_invalid_error(error):
+                raise
+            try:
+                file_size = os.path.getsize(file_name)
+            except OSError:
+                file_size = get_media_size(message)
+            if not is_within_upload_part_limit(upload_client, file_size):
+                raise UploadTooLargeForRelayError(
+                    f"arquivo com {format_bytes(file_size)} excede o limite de upload desta sessao "
+                    f"(partes {build_upload_part_count(file_size)}/{get_upload_max_file_parts(upload_client)})."
+                )
+            if clean_retry_after_parts_invalid:
+                raise
+            clean_retry_after_parts_invalid = True
+            await log_context(
+                context,
+                f"[PRE] {item.label}: FILE_PARTS_INVALID em arquivo dentro do limite; "
+                "tentando reupload limpo uma vez antes de fallback server-side.",
+            )
+            await asyncio.sleep(2)
+
 async def enable_server_copy_fallback(context, item, error):
     item.server_copy_fallback = True
     item.server_copy_reason = simplify_error(error)
@@ -5311,7 +5377,15 @@ async def prepare_single_item_for_publish(source_client, preupload_client, desti
                 item.aux_paths.append(thumb_path)
 
         try:
-            item.remote_media = await upload_media_reference(preupload_client, destination_peer, message, file_name, thumb_path)
+            item.remote_media = await upload_media_reference_with_retry(
+                preupload_client,
+                destination_peer,
+                context,
+                item,
+                message,
+                file_name,
+                thumb_path,
+            )
         except Exception as error:
             if should_use_server_copy_fallback(error):
                 await enable_server_copy_fallback(context, item, error)
@@ -5356,7 +5430,15 @@ async def prepare_album_for_publish(source_client, preupload_client, destination
                 if thumb_path:
                     item.aux_paths.append(thumb_path)
             try:
-                remote_media = await upload_media_reference(preupload_client, destination_peer, message, file_name, thumb_path)
+                remote_media = await upload_media_reference_with_retry(
+                    preupload_client,
+                    destination_peer,
+                    context,
+                    item,
+                    message,
+                    file_name,
+                    thumb_path,
+                )
             except Exception as error:
                 if should_use_server_copy_fallback(error):
                     await enable_server_copy_fallback(context, item, error)
